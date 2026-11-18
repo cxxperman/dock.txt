@@ -865,7 +865,9 @@ namespace DevTxt.DockApp
             menu.Header(new StackPanel { Orientation = Orientation.Horizontal, Children = { mark, brand } });
             menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
             bool online = hub != null && hub.Online;
-            menu.Item(online ? "Настройки" : "Настройки — в core.txt (не запущен)", false, online ? new Action(delegate { hub.ShowCore(); }) : null);
+            // Настройки дока живут в core.txt: открываем его, а если его нет — предлагаем скачать
+            menu.Item(online ? "Настройки" : CoreApp.Installed ? "Настройки — открыть core.txt" : "Скачать core.txt — настройки и остальные приложения", false,
+                delegate { CoreApp.Go(online, delegate { hub.ShowCore(); }); });
             menu.Item("Выход", false, delegate { Quit(); });
             return menu;
         }
