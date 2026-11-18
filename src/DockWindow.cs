@@ -195,6 +195,11 @@ namespace DevTxt.DockApp
             if (demo || headless) return;
             if (store.ReplaceTaskbar) TaskbarSwap.Take(store.Dir); else TaskbarSwap.Give(store.Dir);
             WinKey.Sync(store.ReplaceTaskbar && store.WinKey, Dispatcher, delegate { if (!ended) ToggleApps(); });
+            // Компактная панель Windows: включаем, только когда её выбрали; иначе возвращаем, как было до нас
+            bool changed = store.Bar == "modern" ? TaskbarSwap.CompactOn(store.Dir) : TaskbarSwap.CompactBack(store.Dir);
+            if (changed) TaskbarSwap.RestartExplorer(null);   // Проводник не закрылся сам — не трогаем: панель сменится при следующем входе
+            // Выбрана панель Windows — дока не видно (он остаётся запущенным: настройки, счётчики, меню приложений)
+            if (store.Bar == "modern") Hide(); else if (!fullscreen) Show();
         }
 
         // Всё, что тикает и слушает, останавливается один раз
@@ -234,7 +239,7 @@ namespace DevTxt.DockApp
             if (full != fullscreen)
             {
                 fullscreen = full;   // игра или видео на весь экран — дока нет совсем
-                if (!headless) { if (full) Hide(); else Show(); }
+                if (!headless) { if (full || store.Bar == "modern") Hide(); else Show(); }
             }
             if (++ticks % SlowPollTicks == 0)
             {
@@ -895,7 +900,8 @@ namespace DevTxt.DockApp
             brand.Margin = new Thickness(8, 0, 0, 1); brand.VerticalAlignment = VerticalAlignment.Center;
             menu.Header(new StackPanel { Orientation = Orientation.Horizontal, Children = { mark, brand } });
             menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
-            menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.ReplaceTaskbar = !store.ReplaceTaskbar; store.Save(); SettingsChanged(); });
+            menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.Bar = store.ReplaceTaskbar ? "both" : "dock"; store.Save(); SettingsChanged(); });
+            menu.Item("Компактная панель Windows вместо дока", false, delegate { store.Bar = "modern"; store.Save(); SettingsChanged(); });
             // Значки трея живут в панели задач Windows: показываем её ненадолго, сама спрячется, когда курсор уйдёт
             if (TaskbarSwap.Active) menu.Item("Значки в трее", false, delegate { TaskbarSwap.Peek(); });
             bool online = hub != null && hub.Online;

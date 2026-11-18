@@ -265,7 +265,12 @@ namespace DevTxt.DockApp
         public readonly string Dir;   // null — ничего не читаем и не пишем (--demo)
         public List<Pin> Pins = new List<Pin>();
         public bool AutoHide = false, Magnify = true, ShowRunning = true;
-        public bool ReplaceTaskbar = false, WinKey = true;   // вместо панели задач Windows; кнопка Windows открывает меню дока (только вместе с заменой)
+        // Что внизу экрана: «both» — dock.txt над панелью задач Windows (как было всегда), «dock» — только dock.txt,
+        // панель Windows спрятана; «modern» — только компактная панель задач Windows, дока не видно.
+        public string Bar = "both";
+        public static readonly string[] Bars = { "dock", "modern", "both" };
+        public bool ReplaceTaskbar { get { return Bar == "dock"; } }
+        public bool WinKey = true;   // кнопка Windows открывает меню дока (только когда dock.txt вместо панели задач)
         public int Size = 48;
         // Виджеты и счётчики: ключ настройки → включено. Порядок — тот, в котором они идут на странице настроек.
         public static readonly string[] WidgetKeys = { "widgetMusic", "widgetCalendar", "widgetWeather", "widgetVolume", "widgetBattery", "widgetClock", "badges" };
@@ -309,7 +314,8 @@ namespace DevTxt.DockApp
                 AutoHide = Flag(s, "autoHide", AutoHide);
                 Magnify = Flag(s, "magnify", Magnify);
                 ShowRunning = Flag(s, "showRunning", ShowRunning);
-                ReplaceTaskbar = Flag(s, "replaceTaskbar", ReplaceTaskbar);
+                string bar = Str(s, "bar");
+                Bar = Array.IndexOf(Bars, bar) >= 0 ? bar : Flag(s, "replaceTaskbar", false) ? "dock" : "both";   // прежняя настройка — переключатель
                 WinKey = Flag(s, "winKey", WinKey);
                 foreach (string k in WidgetKeys) Flags[k] = Flag(s, k, true);
                 object size;
@@ -333,7 +339,7 @@ namespace DevTxt.DockApp
                     if (p.Icon != null) one["icon"] = p.Icon;
                     pins.Add(one);
                 }
-                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "replaceTaskbar", ReplaceTaskbar, "winKey", WinKey);
+                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "bar", Bar, "winKey", WinKey);
                 foreach (string k in WidgetKeys) set[k] = Flags[k];
                 var d = HubLink.Msg("pins", pins.ToArray(), "settings", set);
                 Directory.CreateDirectory(Dir);
@@ -367,7 +373,9 @@ namespace DevTxt.DockApp
         {
             var taskbar = new object[]
             {
-                HubLink.Msg("key", "replaceTaskbar", "type", "switch", "label", "Вместо панели задач Windows", "hint", "Панель задач прячется, окна занимают весь экран. Значки трея — в меню дока. Выключите — всё вернётся как было", "value", ReplaceTaskbar),
+                HubLink.Msg("key", "bar", "type", "choice", "label", "Внизу экрана",
+                    "hint", "dock.txt — панель задач Windows прячется, значки трея — в меню дока. Компактная панель Windows — тонкая полоса с часами, разворачивается, когда нужна; дока не видно. При переключении на неё и обратно Проводник перезапускается: открытые папки закроются",
+                    "value", Bar, "options", new object[] { HubLink.Msg("value", "dock", "label", "dock.txt"), HubLink.Msg("value", "modern", "label", "Компактная панель Windows"), HubLink.Msg("value", "both", "label", "dock.txt и панель Windows") }),
                 HubLink.Msg("key", "winKey", "type", "switch", "label", "Кнопка Windows открывает меню дока", "hint", "Вместо «Пуска» — меню приложений dock.txt. Сочетания вроде Win+E и Win+D работают как обычно. Действует вместе с заменой панели задач", "value", WinKey)
             };
             var items = new object[]
@@ -404,12 +412,18 @@ namespace DevTxt.DockApp
                 if (value == null || value is bool || value is string) throw new Exception("нужно число");
                 Size = Clamp(v);
             }
-            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "replaceTaskbar" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
+            else if (key == "bar")
+            {
+                string v = value as string;
+                if (Array.IndexOf(Bars, v) < 0) throw new Exception("нужно одно из: dock, modern, both");
+                Bar = v;
+            }
+            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
             {
                 if (!(value is bool)) throw new Exception("нужно «да» или «нет»");
                 bool on = (bool)value;
                 if (key == "autoHide") AutoHide = on; else if (key == "magnify") Magnify = on; else if (key == "showRunning") ShowRunning = on;
-                else if (key == "replaceTaskbar") ReplaceTaskbar = on; else if (key == "winKey") WinKey = on; else Flags[key] = on;
+                else if (key == "winKey") WinKey = on; else Flags[key] = on;
             }
             else throw new Exception("такой настройки нет");
             Save();

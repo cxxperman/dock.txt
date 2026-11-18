@@ -119,6 +119,83 @@ namespace DevTxt.DockApp
             return main != IntPtr.Zero && IsWindowVisible(main) && GetWindowRect(main, out r) && GetCursorPos(out p) && p.X >= r.L && p.X < r.R && p.Y >= r.T - 8 && p.Y < r.B;
         }
 
+        // ───────── Компактная панель задач Windows 11 ─────────
+        // Тонкая полоса с часами и треем, которая разворачивается, когда нужна. В Windows она задумана для планшетов,
+        // включается значением TabletPostureTaskbar в реестре пользователя и применяется после перезапуска Проводника.
+        const string ExplorerKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer";
+
+        public static int Compact
+        {
+            get
+            {
+                try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ExplorerKey)) { object v = k != null ? k.GetValue("TabletPostureTaskbar") : null; return v is int ? (int)v : 0; } }
+                catch { return 0; }
+            }
+        }
+
+        static void WriteCompact(int v)
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(ExplorerKey)) k.SetValue("TabletPostureTaskbar", v, Microsoft.Win32.RegistryValueKind.DWord);
+        }
+
+        static string CompactMarker(string dir) { return dir == null ? null : Path.Combine(dir, "compact.txt"); }
+
+        // Включить компактную панель. Что было до нас, записывается один раз — чтобы потом вернуть именно это.
+        // true — значение изменилось и Проводник нужно перезапустить.
+        public static bool CompactOn(string dir)
+        {
+            int now = Compact;
+            try
+            {
+                string f = CompactMarker(dir);
+                if (f != null && !File.Exists(f)) { Directory.CreateDirectory(dir); File.WriteAllText(f, now.ToString()); }
+            }
+            catch { }
+            if (now == 1) return false;
+            WriteCompact(1);
+            return true;
+        }
+
+        // Вернуть панель задач такой, какой она была до того, как док включил компактную. true — значение изменилось.
+        public static bool CompactBack(string dir)
+        {
+            string f = CompactMarker(dir);
+            if (f == null || !File.Exists(f)) return false;
+            int was;
+            try { if (!int.TryParse(File.ReadAllText(f).Trim(), out was)) was = 0; File.Delete(f); } catch { return false; }
+            if (Compact == was) return false;
+            WriteCompact(was);
+            return true;
+        }
+
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+
+        // Перезапуск Проводника — бережно: как «Выход из Проводника» в меню панели задач (Ctrl+Shift+правая кнопка),
+        // без принудительного завершения. Работает в фоне. Не закрылся за 10 секунд — не трогаем, false.
+        public static void RestartExplorer(Action<bool> done)
+        {
+            new Thread(delegate()
+            {
+                bool ok = false;
+                try
+                {
+                    IntPtr bar = Bar();
+                    uint pid = 0;
+                    if (bar != IntPtr.Zero) GetWindowThreadProcessId(bar, out pid);
+                    if (pid != 0)
+                    {
+                        var p = System.Diagnostics.Process.GetProcessById((int)pid);
+                        PostMessage(bar, 0x5B4, IntPtr.Zero, IntPtr.Zero);   // WM_USER + 436: Проводник закрывается сам
+                        ok = p.WaitForExit(10000);
+                    }
+                    if (ok && Bar() == IntPtr.Zero) System.Diagnostics.Process.Start(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"));
+                }
+                catch { ok = false; }
+                if (done != null) done(ok);
+            }) { IsBackground = true, Name = "dock explorer" }.Start();
+        }
+
         public static bool Peeking { get { return DateTime.UtcNow < peekUntil; } }
 
         // Раз в секунду: Проводник любит показывать панель задач сам (после меню «Пуск», смены разрешения, перезапуска)

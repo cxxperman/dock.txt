@@ -187,15 +187,22 @@ namespace DevTxt.DockApp
                 a.PinItem(items[4]);
                 a.Apply("autoHide", true);
                 a.Apply("size", 61.4);
-                a.Apply("replaceTaskbar", true);
+                a.Apply("bar", "dock");
                 a.Apply("winKey", false);
                 var b = new Store(dir);
                 Check(b.Load(), "state file is read back");
                 Check(b.Pins.Count == 2 && b.Pins[0].Name == "Чат" && b.Pins[0].Link == @"C:\l\Chat.lnk" && b.Pins[0].Args == "--processStart Chat.exe" && b.Pins[0].Icon == @"C:\Chat\app.ico,0", "a pin keeps its name, link, arguments and icon");
                 Check(b.Pins.Count == 2 && b.Pins[1].Path == @"C:\Tools\term.exe" && b.Pins[1].Name == "name:term.exe", "pinning a running app once adds it once; a Store frame is not pinned");
                 Check(b.AutoHide && b.Magnify && b.ShowRunning && b.Size == 61, "settings are read back");
-                Check(b.ReplaceTaskbar && !b.WinKey, "taskbar replacement and the Windows key setting are read back");
-                Check(new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(b.Describe()).Contains("replaceTaskbar"), "core.txt sees the taskbar settings");
+                Check(b.ReplaceTaskbar && b.Bar == "dock" && !b.WinKey, "the bottom bar choice and the Windows key setting are read back");
+                bool badBar = false;
+                try { b.Apply("bar", "left"); } catch { badBar = true; }
+                Check(badBar && b.Bar == "dock", "an unknown bottom bar is refused");
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"settings\":{\"replaceTaskbar\":true}}");
+                var old = new Store(dir);
+                old.Load();
+                Check(old.Bar == "dock", "the old on/off setting becomes the choice «dock.txt»");
+                Check(new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(b.Describe()).Contains("\"bar\""), "core.txt sees the taskbar settings");
                 Check(!TaskbarSwap.Active && !WinKey.Installed, "a self-test never hides the taskbar or hooks the Windows key");
                 b.UnpinItem(new DockItem { Path = @"c:\tools\TERM.exe" });
                 var c = new Store(dir);
@@ -257,7 +264,7 @@ namespace DevTxt.DockApp
             var tgroup = groups != null && groups.Length == 3 ? (Dictionary<string, object>)groups[1] : null;
             var tlist = tgroup != null ? tgroup["items"] as object[] : null;
             Check(tgroup != null && (string)tgroup["title"] == "Панель задач" && tlist != null && tlist.Length == 2
-                && (string)((Dictionary<string, object>)tlist[0])["key"] == "replaceTaskbar" && !(bool)((Dictionary<string, object>)tlist[0])["value"]
+                && (string)((Dictionary<string, object>)tlist[0])["key"] == "bar" && (string)((Dictionary<string, object>)tlist[0])["value"] == "both" && (string)((Dictionary<string, object>)tlist[0])["type"] == "choice"
                 && (string)((Dictionary<string, object>)tlist[1])["key"] == "winKey", "the second group is «Панель задач»: the replacement is off until asked for, then the Windows key");
             var wgroup = groups != null && groups.Length == 3 ? (Dictionary<string, object>)groups[2] : null;
             var wlist = wgroup != null ? wgroup["items"] as object[] : null;
