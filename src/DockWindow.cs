@@ -114,9 +114,10 @@ namespace DevTxt.DockApp
             // Полоса: тёмная основа (за окном размытия нет — стекло должно читаться на любых обоях), на ней стекло с кромкой
             panel = new Border
             {
-                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.Solid(Tokens.Dark.Menu), SnapsToDevicePixels = true,
+                // Тот же чёрный, что у острова kapsula.txt наверху: верх и низ экрана — один набор, а не два разных
+                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.Solid(Tokens.Dark.Bg), SnapsToDevicePixels = true,
                 Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 22, ShadowDepth = 5, Direction = 270, Opacity = 0.38, Color = Colors.Black },
-                Child = new Border { CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.GlassFill, BorderBrush = Ui.Rim, BorderThickness = new Thickness(1) }
+                Child = new Border { CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Brushes.Transparent, BorderBrush = Ui.Rim, BorderThickness = new Thickness(1) }
             };
             tipText = Ui.T("", Tokens.Size.Caption, Ui.Label, FontWeights.SemiBold);
             tipText.VerticalAlignment = VerticalAlignment.Center;
@@ -131,7 +132,17 @@ namespace DevTxt.DockApp
 
             stage.MouseMove += delegate { StartLoop(); };
             panel.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; OpenMenu(null); };
-            SourceInitialized += delegate { Win.MakeBar(new WindowInteropHelper(this).Handle); };
+            SourceInitialized += delegate
+            {
+                IntPtr me = new WindowInteropHelper(this).Handle;
+                Win.MakeBar(me);
+                // Проводник перезапустился и снова показал свою панель задач — прячем её заново
+                HwndSource.FromHwnd(me).AddHook(delegate(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled)
+                {
+                    if (msg == TaskbarSwap.TaskbarCreated && msg != 0) Dispatcher.BeginInvoke(new Action(SyncTaskbar));
+                    return IntPtr.Zero;
+                });
+            };
 
             if (demo)
             {
@@ -164,18 +175,37 @@ namespace DevTxt.DockApp
                 hub.Start();
                 hub.PublishApps(items);
                 ApplyAutoHide();
+                SyncTaskbar();
+                taskbarTimer.Tick += delegate { TaskbarSwap.Keep(store.Dir); };
+                taskbarTimer.Start();
+                hookTimer.Tick += delegate { WinKey.Refresh(); };
+                hookTimer.Start();
                 AppCatalog.Refresh(null);   // список для меню приложений собирается заранее, в фоне
             }
         }
 
         internal bool Demoing { get { return demo; } }
 
+        readonly DispatcherTimer taskbarTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        readonly DispatcherTimer hookTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+
+        // Панель задач Windows и кнопка Windows — по настройкам
+        void SyncTaskbar()
+        {
+            if (demo || headless) return;
+            if (store.ReplaceTaskbar) TaskbarSwap.Take(store.Dir); else TaskbarSwap.Give(store.Dir);
+            WinKey.Sync(store.ReplaceTaskbar && store.WinKey, Dispatcher, delegate { if (!ended) ToggleApps(); });
+        }
+
         // Всё, что тикает и слушает, останавливается один раз
         void End()
         {
             if (ended) return;
             ended = true;
-            refresh.Stop(); edge.Stop(); minute.Stop();
+            refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop();
+            // Док уходит — панель задач и кнопка Windows возвращаются такими, какими были
+            WinKey.Stop();
+            if (!demo && !headless) TaskbarSwap.Give(store.Dir);
             if (audio != null) audio.Close();
             if (hub != null) hub.Stop();
         }
@@ -317,6 +347,7 @@ namespace DevTxt.DockApp
             if (!demo) items = Collect();
             Rebuild();
             ApplyAutoHide();
+            SyncTaskbar();
             if (hub != null) { hub.PublishSettings(true); hub.PublishApps(items); }
         }
 
@@ -864,6 +895,9 @@ namespace DevTxt.DockApp
             brand.Margin = new Thickness(8, 0, 0, 1); brand.VerticalAlignment = VerticalAlignment.Center;
             menu.Header(new StackPanel { Orientation = Orientation.Horizontal, Children = { mark, brand } });
             menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
+            menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.ReplaceTaskbar = !store.ReplaceTaskbar; store.Save(); SettingsChanged(); });
+            // Значки трея живут в панели задач Windows: показываем её ненадолго, сама спрячется, когда курсор уйдёт
+            if (TaskbarSwap.Active) menu.Item("Значки в трее", false, delegate { TaskbarSwap.Peek(); });
             bool online = hub != null && hub.Online;
             // Настройки дока живут в core.txt: открываем его, а если его нет — предлагаем скачать
             menu.Item(online ? "Настройки" : CoreApp.Installed ? "Настройки — открыть core.txt" : "Скачать core.txt — настройки и остальные приложения", false,

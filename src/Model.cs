@@ -265,6 +265,7 @@ namespace DevTxt.DockApp
         public readonly string Dir;   // null — ничего не читаем и не пишем (--demo)
         public List<Pin> Pins = new List<Pin>();
         public bool AutoHide = false, Magnify = true, ShowRunning = true;
+        public bool ReplaceTaskbar = false, WinKey = true;   // вместо панели задач Windows; кнопка Windows открывает меню дока (только вместе с заменой)
         public int Size = 48;
         // Виджеты и счётчики: ключ настройки → включено. Порядок — тот, в котором они идут на странице настроек.
         public static readonly string[] WidgetKeys = { "widgetMusic", "widgetCalendar", "widgetWeather", "widgetVolume", "widgetBattery", "widgetClock", "badges" };
@@ -308,6 +309,8 @@ namespace DevTxt.DockApp
                 AutoHide = Flag(s, "autoHide", AutoHide);
                 Magnify = Flag(s, "magnify", Magnify);
                 ShowRunning = Flag(s, "showRunning", ShowRunning);
+                ReplaceTaskbar = Flag(s, "replaceTaskbar", ReplaceTaskbar);
+                WinKey = Flag(s, "winKey", WinKey);
                 foreach (string k in WidgetKeys) Flags[k] = Flag(s, k, true);
                 object size;
                 if (s != null && s.TryGetValue("size", out size) && size != null) try { Size = Clamp(Convert.ToDouble(size, System.Globalization.CultureInfo.InvariantCulture)); } catch { }
@@ -330,7 +333,7 @@ namespace DevTxt.DockApp
                     if (p.Icon != null) one["icon"] = p.Icon;
                     pins.Add(one);
                 }
-                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size);
+                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "replaceTaskbar", ReplaceTaskbar, "winKey", WinKey);
                 foreach (string k in WidgetKeys) set[k] = Flags[k];
                 var d = HubLink.Msg("pins", pins.ToArray(), "settings", set);
                 Directory.CreateDirectory(Dir);
@@ -362,6 +365,11 @@ namespace DevTxt.DockApp
         // Описание настроек — в том виде, в каком его ждёт core.txt (kit.txt, hub/PROTOCOL.md, «Настройки приложения»)
         public Dictionary<string, object> Describe()
         {
+            var taskbar = new object[]
+            {
+                HubLink.Msg("key", "replaceTaskbar", "type", "switch", "label", "Вместо панели задач Windows", "hint", "Панель задач прячется, окна занимают весь экран. Значки трея — в меню дока. Выключите — всё вернётся как было", "value", ReplaceTaskbar),
+                HubLink.Msg("key", "winKey", "type", "switch", "label", "Кнопка Windows открывает меню дока", "hint", "Вместо «Пуска» — меню приложений dock.txt. Сочетания вроде Win+E и Win+D работают как обычно. Действует вместе с заменой панели задач", "value", WinKey)
+            };
             var items = new object[]
             {
                 HubLink.Msg("key", "autoHide", "type", "switch", "label", "Автоскрытие", "hint", "Док уезжает за нижний край экрана и возвращается, когда курсор касается этого края", "value", AutoHide),
@@ -382,7 +390,7 @@ namespace DevTxt.DockApp
             };
             var widgets = new object[WidgetKeys.Length];
             for (int i = 0; i < WidgetKeys.Length; i++) widgets[i] = HubLink.Msg("key", WidgetKeys[i], "type", "switch", "label", labels[i], "hint", hints[i], "value", Flags[WidgetKeys[i]]);
-            return HubLink.Msg("groups", new object[] { HubLink.Msg("title", "", "items", items), HubLink.Msg("title", "Виджеты", "items", widgets) });
+            return HubLink.Msg("groups", new object[] { HubLink.Msg("title", "", "items", items), HubLink.Msg("title", "Панель задач", "items", taskbar), HubLink.Msg("title", "Виджеты", "items", widgets) });
         }
 
         // Меняет настройку по ключу. Незнакомый ключ или не то значение — исключение: его текст уйдёт ответом в core.txt.
@@ -396,11 +404,12 @@ namespace DevTxt.DockApp
                 if (value == null || value is bool || value is string) throw new Exception("нужно число");
                 Size = Clamp(v);
             }
-            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || (key != null && Flags.ContainsKey(key)))
+            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "replaceTaskbar" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
             {
                 if (!(value is bool)) throw new Exception("нужно «да» или «нет»");
                 bool on = (bool)value;
-                if (key == "autoHide") AutoHide = on; else if (key == "magnify") Magnify = on; else if (key == "showRunning") ShowRunning = on; else Flags[key] = on;
+                if (key == "autoHide") AutoHide = on; else if (key == "magnify") Magnify = on; else if (key == "showRunning") ShowRunning = on;
+                else if (key == "replaceTaskbar") ReplaceTaskbar = on; else if (key == "winKey") WinKey = on; else Flags[key] = on;
             }
             else throw new Exception("такой настройки нет");
             Save();
