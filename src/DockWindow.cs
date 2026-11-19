@@ -883,9 +883,9 @@ namespace DevTxt.DockApp
             menu.Activate();
         }
 
-        MenuWindow BuildMenu(Slot slot)
+        PopMenu BuildMenu(Slot slot)
         {
-            var menu = new MenuWindow();
+            var menu = new PopMenu();
             DockItem item = slot != null ? slot.Item : null;
             if (item != null)
             {
@@ -895,10 +895,7 @@ namespace DevTxt.DockApp
                 if (item.Running) menu.Item("Закрыть окно", false, delegate { if (!demo && item.Windows.Count > 0) Win.Close(item.Windows[0]); });
                 menu.Line();
             }
-            var mark = Ui.Sprite(DockSprite, 18);
-            var brand = Ui.Brand("dock", Tokens.Size.Heading, FontWeights.SemiBold);
-            brand.Margin = new Thickness(8, 0, 0, 1); brand.VerticalAlignment = VerticalAlignment.Center;
-            menu.Header(new StackPanel { Orientation = Orientation.Horizontal, Children = { mark, brand } });
+            menu.Brand(DockSprite, "dock");
             menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
             menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.Bar = store.ReplaceTaskbar ? "both" : "dock"; store.Save(); SettingsChanged(); });
             menu.Item("Компактная панель Windows вместо дока", false, delegate { store.Bar = "modern"; store.Save(); SettingsChanged(); });
@@ -908,6 +905,7 @@ namespace DevTxt.DockApp
             // Настройки дока живут в core.txt: открываем его, а если его нет — предлагаем скачать
             menu.Item(online ? "Настройки" : CoreApp.Installed ? "Настройки — открыть core.txt" : "Скачать core.txt — настройки и остальные приложения", false,
                 delegate { CoreApp.Go(online, delegate { hub.ShowCore(); }); });
+            menu.Line();
             menu.Item("Выход", false, delegate { Quit(); });
             return menu;
         }
@@ -915,7 +913,7 @@ namespace DevTxt.DockApp
         void OpenMenu(Slot slot)
         {
             if (menuOpen) return;
-            MenuWindow menu = BuildMenu(slot);
+            PopMenu menu = BuildMenu(slot);
             menuOpen = true;
             ShowTip();
             menu.Closed += delegate
@@ -1004,7 +1002,7 @@ namespace DevTxt.DockApp
             if (index >= 0 && withMenu)
             {
                 // Меню — то же самое, что по правому щелчку, только нарисованное в этот же снимок
-                MenuWindow menu = BuildMenu(slots[index].Kind == SlotKind.Item ? slots[index] : null);
+                PopMenu menu = BuildMenu(slots[index].Kind == SlotKind.Item ? slots[index] : null);
                 var box = (FrameworkElement)menu.Content;
                 menu.Content = null;
                 box.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
