@@ -189,14 +189,47 @@ namespace DevTxt.DockApp
             return sb.ToString();
         }
 
-        // Что делает щелчок: не запущено — запустить; окно уже впереди — свернуть; иначе — вывести вперёд
+        // Что делает щелчок: не запущено — запустить; впереди чужое окно — вывести вперёд то, с которым работали последним;
+        // окно программы уже впереди: оно единственное — свернуть, окон несколько — перейти к следующему. «Следующее» —
+        // то, с которым работали давнее всего: так щелчки обходят все окна по кругу, а не скачут между двумя верхними.
         public static Click Decide(DockItem item, IntPtr foreground, out IntPtr target)
         {
             target = IntPtr.Zero;
             if (!item.Running) return Click.Launch;
-            if (foreground != IntPtr.Zero && item.Windows.Contains(foreground)) { target = foreground; return Click.Minimize; }
+            if (foreground != IntPtr.Zero && item.Windows.Contains(foreground))
+            {
+                target = foreground;
+                if (item.Windows.Count == 1) return Click.Minimize;
+                for (int i = item.Windows.Count - 1; i >= 0; i--)
+                    if (item.Windows[i] != foreground) { target = item.Windows[i]; break; }
+                return Click.Activate;
+            }
             target = item.Windows[0];
             return Click.Activate;
+        }
+
+        // Заголовок окна для строки меню: длинный обрезается с «…»
+        public static string Shorten(string text, int max)
+        {
+            text = (text ?? "").Trim();
+            if (max < 2 || text.Length <= max) return text;
+            return text.Substring(0, max - 1).TrimEnd() + "…";
+        }
+
+        // Значок программы, которая играет музыку (Kapsula присылает её имя: «Spotify», «chrome.exe»); null — такой в доке нет
+        public static DockItem Player(List<DockItem> items, string app)
+        {
+            string a = Bare(Lower(app).Trim());
+            if (a.Length == 0 || items == null) return null;
+            DockItem loose = null;
+            foreach (DockItem i in items)
+            {
+                if (!i.Running) continue;
+                string exe = Bare(ExeOf(i)), name = Lower(i.Name).Trim();
+                if (exe == a || name == a) return i;
+                if (loose == null && ((exe.Length >= 3 && a.Contains(exe)) || (name.Length >= 3 && a.Contains(name)) || (a.Length >= 3 && name.Contains(a)))) loose = i;
+            }
+            return loose;
         }
 
         // Окно на весь экран (игра, видео): закрывает его целиком и не имеет заголовка.
@@ -223,18 +256,29 @@ namespace DevTxt.DockApp
         public static double[] Layout(double[] rest, double[] scale, double gap, double u, out double from, out double to)
         {
             int n = rest.Length;
+            double[] rw = new double[n], mw = new double[n];
+            for (int i = 0; i < n; i++) { rw[i] = rest[i] + gap; mw[i] = rest[i] * scale[i] + gap; }
+            double[] left = Cells(rw, mw, u, out from, out to);
+            for (int i = 0; i < n; i++) left[i] += gap / 2;
+            return left;
+        }
+
+        // То же, но в ячейках: rw[i] — сколько места значок с промежутком занимает в покое, mw[i] — сколько сейчас.
+        // Ячейка может быть и нулевой: значок только появляется или уже уходит. Возвращает левые края ячеек.
+        public static double[] Cells(double[] rw, double[] mw, double u, out double from, out double to)
+        {
+            int n = rw.Length;
             var left = new double[n];
             double total = 0;
-            for (int i = 0; i < n; i++) total += rest[i] + gap;
+            for (int i = 0; i < n; i++) total += rw[i];
             u = Math.Max(0, Math.Min(total, u));
             double a = 0, m = 0, anchor = u;
             bool found = false;
             for (int i = 0; i < n; i++)
             {
-                double rw = rest[i] + gap, mw = rest[i] * scale[i] + gap;
-                left[i] = m + gap / 2;
-                if (!found && (u <= a + rw || i == n - 1)) { anchor = m + (u - a) / rw * mw; found = true; }
-                a += rw; m += mw;
+                left[i] = m;
+                if (!found && (u <= a + rw[i] || i == n - 1)) { anchor = m + (rw[i] > 1e-9 ? (u - a) / rw[i] * mw[i] : 0); found = true; }
+                a += rw[i]; m += mw[i];
             }
             double shift = u - anchor;
             for (int i = 0; i < n; i++) left[i] += shift;
@@ -253,6 +297,53 @@ namespace DevTxt.DockApp
                 x += v * h;
                 dt -= h;
             }
+        }
+    }
+
+    // Плавный переход одного числа: от того, что есть сейчас, к новому за заданное время, с резким началом и мягким
+    // торможением (та же кривая, что у Ui.EaseOut). Время приходит снаружи, в миллисекундах; переход можно перебить в любой момент.
+    class Tween
+    {
+        double from, to;
+        long start;
+        int ms;
+        bool running;
+
+        public Tween(double value) { from = to = value; }
+
+        public double Target { get { return to; } }
+        public bool Running { get { return running; } }
+
+        public void Set(double value) { from = to = value; running = false; }
+
+        public void Go(double value, long now, int duration)
+        {
+            if (value == to) return;
+            if (duration <= 0) { Set(value); return; }
+            from = Value(now); to = value; start = now; ms = duration; running = true;
+        }
+
+        public double Value(long now)
+        {
+            if (!running) return to;
+            double t = (now - start) / (double)ms;
+            if (t >= 1) { running = false; return to; }
+            return from + (to - from) * Ease(Math.Max(0, t));
+        }
+
+        // 0..1 → 0..1: показательное торможение, степень 7
+        public static double Ease(double t)
+        {
+            if (t <= 0) return 0;
+            if (t >= 1) return 1;
+            return (1 - Math.Exp(-7 * t)) / (1 - Math.Exp(-7));
+        }
+
+        // Значок подпрыгивает, пока программа запускается: высота от 0 до 1 в момент t (мс), один прыжок длится cycle
+        public static double Bounce(long t, int cycle)
+        {
+            if (t < 0 || cycle <= 0) return 0;
+            return Math.Sin(Math.PI * (t % cycle) / (double)cycle);
         }
     }
 
@@ -391,9 +482,9 @@ namespace DevTxt.DockApp
                 "Что играет, по данным kapsula.txt; под курсором — кнопки «назад», «пауза», «вперёд»",
                 "Ближайшее событие на сегодня, по данным kapsula.txt",
                 "Температура и погода, по данным kapsula.txt",
-                "Колесо мыши меняет громкость, щелчок выключает звук",
+                "Колесо мыши меняет громкость, щелчок открывает быстрые настройки Windows, средняя кнопка выключает звук",
                 "Заряд — только если у компьютера есть батарея",
-                "Время; под курсором — дата",
+                "Время; под курсором — дата, щелчок открывает уведомления и календарь Windows",
                 "Красный счётчик на значках Discord и Steam, по данным kapsula.txt"
             };
             var widgets = new object[WidgetKeys.Length];

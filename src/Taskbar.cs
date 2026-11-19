@@ -232,16 +232,20 @@ namespace DevTxt.DockApp
         const int LWin = 0x5B, RWin = 0x5C, Mask = 0xE8;   // 0xE8 — клавиши с таким кодом не существует
         static readonly IntPtr Ours = new IntPtr(0x444F434B);   // пометка «это нажатие послали мы сами»
 
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+
         static readonly object gate = new object();
         static readonly Proc proc = Callback;
         static Thread thread;
         static uint threadId;
         static volatile IntPtr handle;
+        static volatile bool enabled;   // false — перехватчик ещё стоит (его поток заканчивает работу), но уже ничего не делает
         static Dispatcher ui;
         static Action pressed;
         static bool winDown, other;
+        static readonly int[] mouseButtons = { 1, 2, 4, 5, 6 };   // левая, правая, средняя и две боковые кнопки мыши
 
-        public static bool Installed { get { return handle != IntPtr.Zero; } }
+        public static bool Installed { get { return enabled && handle != IntPtr.Zero; } }
 
         public static void Sync(bool wanted, Dispatcher dispatcher, Action onPress)
         {
@@ -256,12 +260,15 @@ namespace DevTxt.DockApp
                 if (thread != null) return;
                 try { System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(typeof(WinKey).GetMethod("Callback", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static).MethodHandle); } catch { }
                 var ready = new ManualResetEvent(false);
+                uint id = 0;
                 thread = new Thread(delegate()
                 {
-                    threadId = GetCurrentThreadId();
-                    handle = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
+                    id = GetCurrentThreadId();
+                    // Свой перехватчик поток помнит сам: пока он заканчивает работу, уже может стоять перехватчик нового потока
+                    IntPtr mine = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
+                    handle = mine;
                     ready.Set();
-                    if (handle == IntPtr.Zero) return;
+                    if (mine == IntPtr.Zero) return;
                     MSG msg;
                     while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
                     {
@@ -269,13 +276,20 @@ namespace DevTxt.DockApp
                         // Свежий перехватчик раньше, чем снят старый: Windows молча снимает медленные перехватчики
                         IntPtr fresh = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
                         if (fresh == IntPtr.Zero) continue;
-                        IntPtr old = handle; handle = fresh; UnhookWindowsHookEx(old);
+                        IntPtr old = mine;
+                        bool current = handle == old;
+                        mine = fresh;
+                        if (current) handle = fresh;
+                        UnhookWindowsHookEx(old);
                     }
-                    UnhookWindowsHookEx(handle);
-                    handle = IntPtr.Zero;
+                    UnhookWindowsHookEx(mine);
+                    if (handle == mine) handle = IntPtr.Zero;
                 }) { IsBackground = true, Name = "dock winkey", Priority = ThreadPriority.Highest };
                 thread.Start();
                 ready.WaitOne(2000);
+                threadId = id;
+                winDown = false;
+                enabled = true;
             }
         }
 
@@ -284,14 +298,17 @@ namespace DevTxt.DockApp
             lock (gate) if (thread != null && handle != IntPtr.Zero && !winDown) PostThreadMessage(threadId, WM_APP, IntPtr.Zero, IntPtr.Zero);
         }
 
+        // Не ждёт: потоку перехватчика уходит просьба закончить, и он снимает перехватчик сам, в фоне.
+        // Окно дока при этом не замирает (раньше здесь ждали до секунды). С этой же строки перехватчик ничего не делает.
         public static void Stop()
         {
             lock (gate)
             {
+                enabled = false;
                 if (thread == null) return;
-                if (handle != IntPtr.Zero) PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-                thread.Join(1000);
+                if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
                 thread = null;
+                threadId = 0;
                 winDown = false;
             }
         }
@@ -304,16 +321,36 @@ namespace DevTxt.DockApp
             return i;
         }
 
+        // Нажать сочетание с кнопкой Windows от имени человека: Win+A — быстрые настройки, Win+N — уведомления и календарь.
+        // Нажатия помечены как свои: перехватчик выше их пропускает.
+        public static void Chord(int vk)
+        {
+            try { SendInput(4, new INPUT[] { Key(LWin, false), Key(vk, false), Key(vk, true), Key(LWin, true) }, Marshal.SizeOf(typeof(INPUT))); } catch { }
+        }
+
+        // Кнопки мыши, пока держат Windows: перехватчика мыши у дока нет, поэтому спрашиваем у Windows,
+        // нажимали ли их с прошлого вопроса. forget — только сбросить то, что накопилось раньше.
+        static bool MouseUsed(bool forget)
+        {
+            bool used = false;
+            foreach (int b in mouseButtons)
+            {
+                short s = GetAsyncKeyState(b);
+                if (!forget && (s & 0x8001) != 0) used = true;
+            }
+            return used;
+        }
+
         static IntPtr Callback(int code, IntPtr w, IntPtr l)
         {
             try
             {
-                if (code == 0 && Marshal.ReadIntPtr(l, 16) != Ours)
+                if (enabled && code == 0 && Marshal.ReadIntPtr(l, 16) != Ours)
                 {
                     int vk = Marshal.ReadInt32(l, 0) & 0xFF, m = w.ToInt32();
                     bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
                     bool win = vk == LWin || vk == RWin;
-                    if (win && down) { if (!winDown) { winDown = true; other = false; } }
+                    if (win && down) { if (!winDown) { winDown = true; other = false; MouseUsed(true); } }
                     else if (down) { if (winDown) other = true; }
                     else if (win && winDown)
                     {
@@ -322,8 +359,10 @@ namespace DevTxt.DockApp
                         {
                             // Одиночное нажатие: перед отпусканием — несуществующая клавиша, тогда Windows считает,
                             // что кнопку нажимали «с чем-то», и «Пуск» не открывает. Само отпускание посылаем от себя.
+                            // Win + щелчок или перетаскивание мышью — тоже не одиночное: «Пуск» не открываем, но и своё меню тоже.
+                            bool mouse = MouseUsed(false);
                             SendInput(3, new INPUT[] { Key(Mask, false), Key(Mask, true), Key(vk, true) }, Marshal.SizeOf(typeof(INPUT)));
-                            if (ui != null && pressed != null) ui.BeginInvoke(DispatcherPriority.Send, pressed);
+                            if (!mouse && ui != null && pressed != null) ui.BeginInvoke(DispatcherPriority.Send, pressed);
                             return new IntPtr(1);
                         }
                     }

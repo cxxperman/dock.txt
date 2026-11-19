@@ -70,6 +70,35 @@ namespace DevTxt.DockApp
 
         public static IntPtr Foreground() { return GetForegroundWindow(); }
 
+        // Заголовок окна — для списка окон в меню значка
+        public static string Title(IntPtr hwnd)
+        {
+            try { return Text(hwnd); } catch { return ""; }
+        }
+
+        // Windows сама сообщает, что впереди стало другое окно: точка под значком и полноэкранный режим не ждут секунду.
+        // Это не перехватчик ввода: сообщение приходит в поток окна дока, в чужие программы ничего не внедряется.
+        delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+        [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventProc proc, uint pid, uint tid, uint flags);
+        [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+        const uint EVENT_SYSTEM_FOREGROUND = 3;
+        static WinEventProc watchProc;   // держим ссылку: иначе сборщик мусора уберёт то, что зовёт Windows
+        static IntPtr watch;
+
+        public static void WatchForeground(Action changed)
+        {
+            if (watch != IntPtr.Zero || changed == null) return;
+            watchProc = delegate { try { changed(); } catch { } };
+            try { watch = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, watchProc, 0, 0, 0); } catch { watch = IntPtr.Zero; }
+        }
+
+        public static void Unwatch()
+        {
+            if (watch == IntPtr.Zero) return;
+            try { UnhookWinEvent(watch); } catch { }
+            watch = IntPtr.Zero;
+        }
+
         static string Text(IntPtr hwnd)
         {
             int n = GetWindowTextLength(hwnd);
@@ -333,6 +362,35 @@ namespace DevTxt.DockApp
                 try { info.WorkingDirectory = Path.GetDirectoryName(item.Path); } catch { }
             }
             using (Process.Start(info)) { }
+        }
+
+        // «Показать в папке»: Проводник открывает папку программы и выделяет её файл
+        public static void Reveal(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            using (Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + path + "\"") { UseShellExecute = true })) { }
+        }
+    }
+
+    // Выключение, перезагрузка, сон и блокировка из меню приложений. Работает только в настоящем доке:
+    // пока Armed не включён (снимки, --demo, --selftest, --probe, --headless), Run ничего не делает.
+    static class Session
+    {
+        [DllImport("user32.dll")] static extern bool LockWorkStation();
+
+        public static bool Armed;
+
+        public static bool Run(string kind)
+        {
+            string exe, args;
+            if (!Armed || !SessionRules.Command(kind, out exe, out args)) return false;
+            try
+            {
+                if (exe == null) return LockWorkStation();
+                using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, exe), args) { UseShellExecute = false, CreateNoWindow = true })) { }
+                return true;
+            }
+            catch { return false; }
         }
     }
 }

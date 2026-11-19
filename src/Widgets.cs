@@ -355,5 +355,45 @@ namespace DevTxt.DockApp
             if (dy > 0 && to >= count && index / Math.Max(1, columns) < (count - 1) / Math.Max(1, columns)) to = count - 1;
             return to < 0 || to >= count ? index : to;
         }
+
+        // Home, End, PageUp, PageDown: jump — «home», «end», «up», «down»; rows — сколько строк помещается на экране.
+        // Страница сдвигает выбор на rows строк в том же столбце и останавливается на первой или последней строке.
+        public static int Jump(int index, int count, int columns, int rows, string jump)
+        {
+            if (count <= 0) return -1;
+            if (jump == "home") return 0;
+            if (jump == "end") return count - 1;
+            if (index < 0) return 0;
+            columns = Math.Max(1, columns); rows = Math.Max(1, rows);
+            int col = index % columns, row = index / columns, last = (count - 1) / columns;
+            row = jump == "up" ? Math.Max(0, row - rows) : Math.Min(last, row + rows);
+            return Math.Min(count - 1, row * columns + col);
+        }
+    }
+
+    // Нижний ряд меню приложений: выключение, перезагрузка, сон, блокировка. Здесь — только что это за команды;
+    // запускает их Session в Win.cs, и только в настоящем доке.
+    static class SessionRules
+    {
+        public static readonly string[] Kinds = { "shutdown", "restart", "sleep", "lock" };
+
+        public static string Label(string kind) { return kind == "shutdown" ? "Завершение работы" : kind == "restart" ? "Перезагрузка" : kind == "sleep" ? "Сон" : "Блокировка"; }
+
+        // Что написать на кнопке после первого щелчка; null — действие безобидное, второй щелчок не нужен
+        public static string Confirm(string kind) { return kind == "shutdown" ? "Точно выключить?" : kind == "restart" ? "Точно перезагрузить?" : null; }
+
+        // Значок из Segoe Fluent Icons
+        public static string Glyph(string kind) { return kind == "shutdown" ? "" : kind == "restart" ? "" : kind == "sleep" ? "" : ""; }
+
+        // Программа и её параметры; у блокировки программы нет — её делает сама Windows (LockWorkStation). false — такой команды нет.
+        public static bool Command(string kind, out string exe, out string args)
+        {
+            exe = null; args = null;
+            if (kind == "shutdown") { exe = "shutdown.exe"; args = "/s /t 0"; }
+            else if (kind == "restart") { exe = "shutdown.exe"; args = "/r /t 0"; }
+            else if (kind == "sleep") { exe = "rundll32.exe"; args = "powrprof.dll,SetSuspendState 0,1,0"; }
+            else if (kind != "lock") return false;
+            return true;
+        }
     }
 }

@@ -132,20 +132,33 @@ namespace DevTxt.DockApp
     }
 
     // Содержимое меню приложений. Отдельно от окна — чтобы его можно было нарисовать в файл, не показывая (--apps --shot).
+    // Ячейки значков делаются один раз: поиск только переставляет их и прячет лишние, а не собирает сетку заново.
     class AppMenuView
     {
-        const double CellW = 124, CellH = 122, IconSize = 60, FieldW = 440, FieldH = 46, Dim = 0.82, Glow = 0.5;
+        const double CellW = 124, CellH = 122, IconSize = 60, FieldW = 440, FieldH = 46, Dim = 0.82, Glow = 0.5, PowerH = 34;
+        const int ConfirmSeconds = 4;
         public readonly Grid Root;
         public readonly TextBox Box;
         public Action<AppEntry> Launch;
         public Action Dismiss;
+        public Action<string> OnSession;   // выключение, перезагрузка, сон, блокировка; null — кнопки ничего не делают (снимок, --demo)
         readonly TextBlock placeholder, note;
-        readonly WrapPanel grid = new WrapPanel { Orientation = Orientation.Horizontal };
+        readonly Canvas grid = new Canvas { VerticalAlignment = VerticalAlignment.Top };
         readonly ScrollViewer scroll;
-        readonly List<Border> cells = new List<Border>();
+        readonly Dictionary<string, Cell> made = new Dictionary<string, Cell>(StringComparer.OrdinalIgnoreCase);
+        readonly List<Cell> cells = new List<Cell>();   // то, что сейчас показано, по порядку
         readonly int columns;
-        List<AppEntry> all, shown = new List<AppEntry>();
+        List<AppEntry> all;
+        Cell marked;
         int selected = -1;
+        Point lastMouse = new Point(-1, -1);
+
+        class Cell
+        {
+            public AppEntry Entry;
+            public Border Root;
+            public int Index = -1;   // место в показанном; −1 — спрятана
+        }
 
         // desktop — подложить под затемнение тёмный фон со свечением: для снимка, где за окном ничего нет
         public AppMenuView(double w, double h, List<AppEntry> apps, bool desktop)
@@ -183,10 +196,14 @@ namespace DevTxt.DockApp
             field.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; Box.Focus(); };
             DockPanel.SetDock(field, System.Windows.Controls.Dock.Top);
 
+            // Внизу — питание и подсказка о клавишах
+            var power = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 16, 0, 0) };
+            foreach (string kind in SessionRules.Kinds) power.Children.Add(PowerButton(kind));
             TextBlock keys = Ui.T("Enter — открыть  ·  стрелки — выбрать  ·  Esc — закрыть", Tokens.Size.Caption, Ui.Label3, FontWeights.Normal);
             keys.HorizontalAlignment = HorizontalAlignment.Center;
-            keys.Margin = new Thickness(0, 14, 0, 26);
-            DockPanel.SetDock(keys, System.Windows.Controls.Dock.Bottom);
+            keys.Margin = new Thickness(0, 12, 0, 22);
+            var bottom = new StackPanel { Children = { power, keys } };
+            DockPanel.SetDock(bottom, System.Windows.Controls.Dock.Bottom);
 
             note = Ui.T("", Tokens.Size.Heading, Ui.Label2, FontWeights.Normal);
             note.HorizontalAlignment = HorizontalAlignment.Center;
@@ -195,26 +212,40 @@ namespace DevTxt.DockApp
 
             grid.Width = columns * CellW;
             grid.HorizontalAlignment = HorizontalAlignment.Center;
+            // Полоса прокрутки — тонкая, из общих стилей kit.txt (Ui.Styles), и только когда есть что листать
             scroll = new ScrollViewer
             {
-                Content = grid, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = grid, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 Focusable = false, Margin = new Thickness(0, 30, 0, 0), HorizontalAlignment = HorizontalAlignment.Center
             };
-            Root.Children.Add(new DockPanel { LastChildFill = true, Children = { field, keys, new Grid { Children = { scroll, note } } } });
+            // Колесо прокрутило список под неподвижным курсором — выбранным становится то, что теперь под ним
+            scroll.PreviewMouseWheel += delegate { lastMouse = new Point(-1, -1); };
+            Root.Children.Add(new DockPanel { LastChildFill = true, Children = { field, bottom, new Grid { Children = { scroll, note } } } });
 
             Root.MouseLeftButtonDown += delegate { if (Dismiss != null) Dismiss(); };   // щелчок мимо значков и поиска закрывает
             Box.TextChanged += delegate { Fill(); };
             Fill();
         }
 
-        public int Count { get { return shown.Count; } }
+        public int Count { get { return cells.Count; } }
 
         // Список собрался или обновился, пока меню открыто
         public void SetApps(List<AppEntry> apps)
         {
             all = apps;
+            // Ячейки программ, которых больше нет, убираются; остальные остаются теми же
+            var alive = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            if (apps != null) foreach (AppEntry e in apps) alive[KeyOf(e)] = true;
+            foreach (string key in new List<string>(made.Keys))
+            {
+                if (alive.ContainsKey(key)) continue;
+                grid.Children.Remove(made[key].Root);
+                made.Remove(key);
+            }
             Fill();
         }
+
+        static string KeyOf(AppEntry e) { return (e.Link ?? "") + "|" + (e.Target ?? "") + "|" + (e.Args ?? ""); }
 
         static int TintOf(string name)
         {
@@ -223,67 +254,165 @@ namespace DevTxt.DockApp
             return sum;
         }
 
+        // Ячейка программы: та же, что в прошлый раз, или новая
+        Cell CellFor(AppEntry entry)
+        {
+            string key = KeyOf(entry);
+            Cell cell;
+            if (made.TryGetValue(key, out cell))
+            {
+                if (ReferenceEquals(cell.Entry.Image, entry.Image)) { cell.Entry = entry; return cell; }
+                grid.Children.Remove(cell.Root);   // значок появился или сменился — ячейка делается заново
+            }
+            cell = new Cell { Entry = entry };
+            FrameworkElement face;
+            if (entry.Image != null)
+            {
+                var image = new Image { Source = entry.Image, Width = IconSize, Height = IconSize, HorizontalAlignment = HorizontalAlignment.Center };
+                RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
+                face = image;
+            }
+            else
+            {
+                face = Glyphs.LetterTile(entry.Name, IconSize / 0.92, TintOf(entry.Name));
+                face.Margin = new Thickness(0, -2, 0, -3);
+            }
+            TextBlock name = Ui.T(entry.Name, Tokens.Size.Caption, Ui.Label, FontWeights.Normal);
+            name.TextWrapping = TextWrapping.Wrap;
+            name.TextAlignment = TextAlignment.Center;
+            name.MaxHeight = 32;
+            name.Margin = new Thickness(0, 8, 0, 0);
+            Border root = new Border
+            {
+                Width = CellW - 8, Height = CellH - 8, Margin = new Thickness(4), CornerRadius = new CornerRadius(Tokens.Radius.Row), Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
+                BorderThickness = new Thickness(1), Padding = new Thickness(6, 11, 6, 0), Child = new StackPanel { Children = { face, name } }
+            };
+            cell.Root = root;
+            Cell me = cell;
+            // Курсор двигает ту же подсветку, что и стрелки: выбранное всегда одно. Считается только настоящее движение мыши —
+            // когда список прокрутился под неподвижным курсором от клавиш, выбор остаётся за клавишами.
+            root.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                Point p = e.GetPosition(Root);
+                if (p == lastMouse) return;
+                lastMouse = p;
+                if (me.Index >= 0 && me.Index != selected) Select(me.Index, false);
+            };
+            root.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; if (me.Index >= 0) Select(me.Index, false); root.Background = Ui.Press; };
+            root.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; if (Launch != null) Launch(me.Entry); };
+            made[key] = cell;
+            grid.Children.Add(root);
+            return cell;
+        }
+
+        // Показывает то, что подходит к запросу: ячейки встают по порядку, остальные прячутся
         void Fill()
         {
             string query = Box.Text;
             placeholder.Visibility = query.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-            shown = AppRules.Filter(all, query);
-            grid.Children.Clear();
+            List<AppEntry> list = AppRules.Filter(all, query);
+            Select(-1, false);
+            foreach (Cell c in made.Values) c.Index = -1;
             cells.Clear();
-            for (int i = 0; i < shown.Count; i++)
+            for (int i = 0; i < list.Count; i++)
             {
-                AppEntry entry = shown[i];
-                int index = i;
-                FrameworkElement face;
-                if (entry.Image != null)
-                {
-                    var image = new Image { Source = entry.Image, Width = IconSize, Height = IconSize, HorizontalAlignment = HorizontalAlignment.Center };
-                    RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
-                    face = image;
-                }
-                else
-                {
-                    face = Glyphs.LetterTile(entry.Name, IconSize / 0.92, TintOf(entry.Name));
-                    face.Margin = new Thickness(0, -2, 0, -3);
-                }
-                TextBlock name = Ui.T(entry.Name, Tokens.Size.Caption, Ui.Label, FontWeights.Normal);
-                name.TextWrapping = TextWrapping.Wrap;
-                name.TextAlignment = TextAlignment.Center;
-                name.MaxHeight = 32;
-                name.Margin = new Thickness(0, 8, 0, 0);
-                var cell = new Border
-                {
-                    Width = CellW - 8, Height = CellH - 8, Margin = new Thickness(4), CornerRadius = new CornerRadius(Tokens.Radius.Row), Background = Brushes.Transparent, BorderBrush = Brushes.Transparent,
-                    BorderThickness = new Thickness(1), Padding = new Thickness(6, 11, 6, 0), Child = new StackPanel { Children = { face, name } }
-                };
-                cell.MouseEnter += delegate { if (index != selected) cell.Background = Ui.Fill; };
-                cell.MouseLeave += delegate { if (index != selected) cell.Background = Brushes.Transparent; };
-                cell.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
-                cell.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; if (Launch != null) Launch(entry); };
-                cells.Add(cell);
-                grid.Children.Add(cell);
+                Cell c = CellFor(list[i]);
+                c.Index = i;
+                cells.Add(c);
+                Canvas.SetLeft(c.Root, (i % columns) * CellW);
+                Canvas.SetTop(c.Root, (i / columns) * CellH);
+                if (c.Root.Visibility != Visibility.Visible) c.Root.Visibility = Visibility.Visible;
             }
-            note.Text = all == null ? "Собираю список приложений…" : shown.Count == 0 ? "Ничего не найдено" : "";
-            selected = -1;
-            Select(shown.Count > 0 ? 0 : -1);   // Enter открывает первое найденное
+            foreach (Cell c in made.Values)
+                if (c.Index < 0 && c.Root.Visibility != Visibility.Collapsed) c.Root.Visibility = Visibility.Collapsed;
+            grid.Height = Math.Ceiling(list.Count / (double)columns) * CellH;
+            note.Text = all == null ? "Собираю список приложений…" : list.Count == 0 ? "Ничего не найдено" : "";
+            Select(list.Count > 0 ? 0 : -1, false);   // Enter открывает первое найденное
             scroll.ScrollToTop();
         }
 
-        void Select(int index)
+        // reveal — прокрутить список так, чтобы выбранное было видно (для клавиш; под курсором оно и так на виду)
+        void Select(int index, bool reveal)
         {
-            if (selected >= 0 && selected < cells.Count) { cells[selected].Background = Brushes.Transparent; cells[selected].BorderBrush = Brushes.Transparent; }
-            selected = index;
-            if (selected < 0 || selected >= cells.Count) return;
-            cells[selected].Background = Ui.GlassHover;
-            cells[selected].BorderBrush = Ui.Rim;
-            cells[selected].BringIntoView();
+            if (marked != null) { marked.Root.Background = Brushes.Transparent; marked.Root.BorderBrush = Brushes.Transparent; }
+            selected = index >= 0 && index < cells.Count ? index : -1;
+            marked = selected < 0 ? null : cells[selected];
+            if (marked == null) return;
+            marked.Root.Background = Ui.GlassHover;
+            marked.Root.BorderBrush = Ui.Rim;
+            if (reveal) marked.Root.BringIntoView();
         }
 
-        public void Move(int dx, int dy) { Select(AppRules.Move(selected, shown.Count, columns, dx, dy)); }
+        public void Move(int dx, int dy) { Select(AppRules.Move(selected, cells.Count, columns, dx, dy), true); }
+
+        // Home, End, PageUp, PageDown
+        public void Jump(string jump)
+        {
+            double view = scroll.ViewportHeight > 0 ? scroll.ViewportHeight : scroll.ActualHeight;
+            Select(AppRules.Jump(selected, cells.Count, columns, (int)Math.Max(1, Math.Floor(view / CellH)), jump), true);
+        }
 
         public void LaunchSelected()
         {
-            if (selected >= 0 && selected < shown.Count && Launch != null) Launch(shown[selected]);
+            if (selected >= 0 && selected < cells.Count && Launch != null) Launch(cells[selected].Entry);
+        }
+
+        // Кнопка питания. Сон и блокировка срабатывают сразу. Выключение и перезагрузка — со второго щелчка:
+        // после первого кнопка спрашивает «Точно выключить?» и через несколько секунд сама возвращается назад.
+        Border PowerButton(string kind)
+        {
+            string label = SessionRules.Label(kind), confirm = SessionRules.Confirm(kind);
+            TextBlock icon = Ui.Glyph(SessionRules.Glyph(kind));
+            icon.FontSize = Tokens.Size.Body; icon.Foreground = Ui.Label2; icon.VerticalAlignment = VerticalAlignment.Center; icon.Margin = new Thickness(0, 0, 8, 0);
+            TextBlock text = Ui.T(label, Tokens.Size.Body, Ui.Label, FontWeights.Normal);
+            text.VerticalAlignment = VerticalAlignment.Center;
+            text.Margin = new Thickness(0, 0, 0, 1);
+            if (confirm != null)
+            {
+                // Вопрос не меняет ширину кнопки: соседние кнопки не уезжают из-под курсора
+                double widest = 0;
+                foreach (string t in new string[] { label, confirm })
+                {
+                    TextBlock probe = Ui.T(t, Tokens.Size.Body, Ui.Label, FontWeights.Normal);
+                    probe.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    widest = Math.Max(widest, probe.DesiredSize.Width);
+                }
+                text.MinWidth = Math.Ceiling(widest);
+            }
+            Border b = Glyphs.Capsule(new StackPanel { Orientation = Orientation.Horizontal, Children = { icon, text } }, PowerH, 14);
+            b.Margin = new Thickness(4, 0, 4, 0);
+            Brush danger = Ui.Solid(Ui.Alpha(Tokens.Palette.Red, 0.6)), rest = b.Background;
+            bool armed = false, over = false;
+            var back = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(ConfirmSeconds) };
+            Action paint = delegate { b.Background = armed ? danger : over ? Ui.GlassHover : rest; };
+            Action disarm = delegate
+            {
+                back.Stop();
+                if (!armed) return;
+                armed = false;
+                text.Text = label;
+                paint();
+            };
+            back.Tick += delegate { disarm(); };
+            Action press = delegate
+            {
+                if (confirm != null && !armed)
+                {
+                    armed = true;
+                    text.Text = confirm;
+                    paint();
+                    back.Stop(); back.Start();
+                    return;
+                }
+                disarm();
+                if (OnSession != null) OnSession(kind);
+            };
+            b.MouseEnter += delegate { over = true; paint(); };
+            b.MouseLeave += delegate { over = false; paint(); };
+            b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
+            b.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; press(); };
+            Ui.Keyboard(b, press);
+            return b;
         }
 
         // Появление: значки поднимаются и проявляются короткой волной — общим движением из kit.txt.
@@ -308,6 +437,7 @@ namespace DevTxt.DockApp
     // Окно меню приложений: на весь главный экран, берёт фокус; закрывается по Esc, щелчку мимо и когда фокус ушёл
     class AppMenuWindow : Window
     {
+        const int FadeOutMs = 120;
         readonly AppMenuView view;
         bool closing;
 
@@ -335,16 +465,27 @@ namespace DevTxt.DockApp
                 if (demo) return;
                 try { Shell.Open(e.Link); } catch { }
             };
+            // Питание — только в настоящем доке; в --demo кнопки нарисованы, но ничего не делают
+            if (!demo) view.OnSession = delegate(string kind) { Shut(); Session.Run(kind); };
             Content = view.Root;
 
             PreviewKeyDown += delegate(object s, KeyEventArgs e)
             {
+                if (closing) { e.Handled = true; return; }
                 if (e.Key == Key.Escape) Shut();
-                else if (e.Key == Key.Enter) view.LaunchSelected();
+                else if (e.Key == Key.Enter)
+                {
+                    if (!view.Box.IsKeyboardFocusWithin) return;   // Enter на кнопке питания нажимает её, а не открывает программу
+                    view.LaunchSelected();
+                }
                 else if (e.Key == Key.Left) view.Move(-1, 0);
                 else if (e.Key == Key.Right) view.Move(1, 0);
                 else if (e.Key == Key.Up) view.Move(0, -1);
                 else if (e.Key == Key.Down) view.Move(0, 1);
+                else if (e.Key == Key.Home) view.Jump("home");
+                else if (e.Key == Key.End) view.Jump("end");
+                else if (e.Key == Key.PageUp) view.Jump("up");
+                else if (e.Key == Key.PageDown) view.Jump("down");
                 else return;
                 e.Handled = true;
             };
@@ -360,11 +501,16 @@ namespace DevTxt.DockApp
             if (!demo) AppCatalog.Refresh(delegate { Dispatcher.BeginInvoke(new Action(delegate { if (!closing) view.SetApps(AppCatalog.Cached); })); });
         }
 
-        void Shut()
+        // Закрытие: меню быстро гаснет и только потом исчезает
+        internal void Shut()
         {
             if (closing) return;
             closing = true;
-            Close();
+            view.Root.IsHitTestVisible = false;
+            if (!Ui.Live(view.Root)) { Close(); return; }
+            var fade = new DoubleAnimation(0, TimeSpan.FromMilliseconds(FadeOutMs)) { EasingFunction = Ui.EaseOut };
+            fade.Completed += delegate { try { Close(); } catch { } };
+            view.Root.BeginAnimation(OpacityProperty, fade);
         }
     }
 }

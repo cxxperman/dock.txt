@@ -50,6 +50,9 @@ namespace DevTxt.DockApp
             if (!created) return 0;   // док уже на экране
 
             var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            Ui.Styles(app.Resources);   // общие подсказки и тонкие полосы прокрутки из kit.txt
+            // Выключение, перезагрузка, сон и блокировка из меню приложений работают только в настоящем доке
+            Session.Armed = !demo && !headless && !probe && shot == null;
             if (shot != null && Array.IndexOf(args, "--apps") >= 0)
             {
                 // Меню приложений: выдуманный список или настоящий, собранный прямо сейчас
@@ -170,7 +173,34 @@ namespace DevTxt.DockApp
             IntPtr target;
             Check(Logic.Decide(items[2], new IntPtr(2), out target) == Click.Launch, "not running — launch");
             Check(Logic.Decide(items[0], new IntPtr(1), out target) == Click.Activate && target == new IntPtr(2), "running, another window ahead — bring the most recent one forward");
-            Check(Logic.Decide(items[0], new IntPtr(5), out target) == Click.Minimize && target == new IntPtr(5), "already ahead — minimise that very window");
+            Check(Logic.Decide(items[1], new IntPtr(3), out target) == Click.Minimize && target == new IntPtr(3), "its only window is already ahead — minimise that very window");
+            Check(Logic.Decide(items[0], new IntPtr(2), out target) == Click.Activate && target == new IntPtr(5), "two windows, the top one ahead — go to the other one instead of minimising");
+            Check(Logic.Decide(items[0], new IntPtr(5), out target) == Click.Activate && target == new IntPtr(2), "two windows, the lower one ahead — go to the other one");
+            var many = new DockItem { Key = "m", Name = "Many" };
+            foreach (int h in new int[] { 11, 12, 13 }) many.Windows.Add(new IntPtr(h));
+            Check(Logic.Decide(many, new IntPtr(99), out target) == Click.Activate && target == new IntPtr(11), "three windows, another app ahead — the most recent one comes forward");
+            string round = "";
+            for (int i = 0; i < 4; i++)
+            {
+                // Каждый щелчок выводит окно вперёд: оно встаёт первым в списке, как сделала бы Windows
+                Click c = Logic.Decide(many, many.Windows[0], out target);
+                round += (c == Click.Activate ? "" : "?") + target + " ";
+                many.Windows.Remove(target);
+                many.Windows.Insert(0, target);
+            }
+            Check(round == "13 12 11 13 ", "clicks walk through all three windows in a circle, got " + round);
+            Check(Logic.Shorten("  Короткий  ", 20) == "Короткий" && Logic.Shorten("Очень длинный заголовок окна", 12) == "Очень длинн…" && Logic.Shorten(null, 5) == "" && Logic.Shorten("abc def ghi", 5) == "abc…", "a long window title is cut with «…»");
+            var players = new List<DockItem>
+            {
+                new DockItem { Key = "a", Name = "Браузер", Path = @"C:\b\chrome.exe" },
+                new DockItem { Key = "b", Name = "Spotify", Path = @"C:\s\Spotify.exe" },
+                new DockItem { Key = "c", Name = "Музыка Яндекс", Path = @"C:\y\ym.exe" }
+            };
+            Check(Logic.Player(players, "Spotify") == null, "a player with no window cannot be brought forward");
+            foreach (DockItem p in players) p.Windows.Add(new IntPtr(1));
+            Check(Logic.Player(players, "Spotify") == players[1] && Logic.Player(players, "spotify.exe") == players[1] && Logic.Player(players, "CHROME.EXE") == players[0], "the player is found by its name or its file");
+            Check(Logic.Player(players, "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify") == players[1] && Logic.Player(players, "музыка") == players[2], "…and by a longer id that contains it, or a part of its name");
+            Check(Logic.Player(players, "") == null && Logic.Player(players, null) == null && Logic.Player(players, "Winamp") == null && Logic.Player(null, "x") == null, "no player in the dock — nothing to bring forward");
             Check(Logic.IsFullscreen(0, 0, 1920, 1080, 1920, 1080, false), "borderless window over the whole screen is fullscreen");
             Check(!Logic.IsFullscreen(-8, -8, 1928, 1088, 1920, 1080, true), "a maximised window with a caption is not");
             Check(!Logic.IsFullscreen(0, 0, 1920, 1040, 1920, 1080, false), "a window that leaves the taskbar visible is not");
@@ -246,6 +276,27 @@ namespace DevTxt.DockApp
             }
             left = Magnify.Layout(new double[0], new double[0], 8, 10, out from, out to);
             Check(left.Length == 0 && Near(to - from, 0), "an empty dock lays out to nothing");
+            // ── Значок появляется и уходит: его ячейка растёт от нуля, соседи раздвигаются ──
+            double[] cells = Magnify.Cells(new double[] { 56, 0, 56 }, new double[] { 56, 0, 56 }, 56, out from, out to);
+            Check(Near(cells[0], 0) && Near(cells[1], 56) && Near(cells[2], 56) && Near(to - from, 112) && !double.IsNaN(from), "a slot that has not grown yet takes no room and breaks nothing");
+            cells = Magnify.Cells(new double[] { 56, 28, 56 }, new double[] { 56, 28, 56 }, 0, out from, out to);
+            Check(Near(cells[2], 84) && Near(to - from, 140), "a half-grown slot takes half its room");
+            cells = Magnify.Cells(new double[] { 0, 0 }, new double[] { 0, 0 }, 5, out from, out to);
+            Check(Near(to - from, 0) && !double.IsNaN(cells[0]) && !double.IsNaN(cells[1]), "all slots at zero width lay out without dividing by zero");
+            var tw = new Tween(1);
+            Check(Near(tw.Value(0), 1) && !tw.Running, "a tween at rest holds its value");
+            tw.Go(0.92, 1000, 70);
+            Check(tw.Running && Near(tw.Value(1000), 1) && tw.Value(1035) < 0.94 && tw.Value(1035) > 0.92 && Near(tw.Value(1070), 0.92) && !tw.Running, "press: most of the way down in half the time, exactly there at the end");
+            tw.Go(1, 2000, 220);
+            double mid = tw.Value(2050);
+            tw.Go(0.92, 2050, 70);
+            Check(Near(tw.Value(2050), mid) && mid > 0.92 && mid < 1, "a tween interrupted half-way continues from where it was, without a jump");
+            tw.Set(0.5);
+            tw.Go(0.5, 3000, 100);
+            Check(!tw.Running && Near(tw.Value(3050), 0.5) && Near(tw.Target, 0.5), "going to where it already is starts nothing");
+            Check(Near(Tween.Ease(0), 0) && Near(Tween.Ease(1), 1) && Tween.Ease(0.3) > 0.8 && Tween.Ease(0.2) < Tween.Ease(0.4), "the ease starts fast and brakes softly");
+            Check(Near(Tween.Bounce(0, 560), 0) && Near(Tween.Bounce(280, 560), 1) && Tween.Bounce(560, 560) < 1e-9 && Near(Tween.Bounce(840, 560), 1) && Near(Tween.Bounce(-5, 560), 0), "a launch bounce goes up and comes back once per cycle");
+
             double x = 0, v = 0;
             for (int i = 0; i < 20; i++) Magnify.Spring(ref x, ref v, 1, Tokens.Motion.SpringShapeStiffness, Tokens.Motion.SpringShapeDamping, 1.0 / 60);
             Check(x > 0.6 && x < 1.2, "the spring is most of the way in a third of a second, got " + x);
@@ -464,6 +515,18 @@ namespace DevTxt.DockApp
             Check(AppRules.Move(0, 10, 4, 1, 0) == 1 && AppRules.Move(0, 10, 4, -1, 0) == 0 && AppRules.Move(1, 10, 4, 0, 1) == 5 && AppRules.Move(5, 10, 4, 0, -1) == 1 && AppRules.Move(1, 10, 4, 0, -1) == 1, "arrows move the selection and stop at the edges");
             Check(AppRules.Move(6, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 1, 0) == 9 && AppRules.Move(-1, 10, 4, 0, 1) == 0 && AppRules.Move(0, 0, 4, 1, 0) == -1, "down from above a short last row lands on the last app");
             Check(AppCatalog.Demo().Count == 28, "the demo menu has 28 apps");
+            Check(AppRules.Jump(5, 30, 4, 3, "home") == 0 && AppRules.Jump(5, 30, 4, 3, "end") == 29 && AppRules.Jump(-1, 30, 4, 3, "down") == 0 && AppRules.Jump(3, 0, 4, 3, "end") == -1, "Home and End go to the first and the last app");
+            Check(AppRules.Jump(5, 30, 4, 3, "down") == 17 && AppRules.Jump(17, 30, 4, 3, "up") == 5 && AppRules.Jump(5, 30, 4, 3, "up") == 1 && AppRules.Jump(22, 30, 4, 3, "down") == 29 && AppRules.Jump(27, 30, 4, 3, "down") == 29, "PageUp and PageDown move by a screen of rows, keep the column and stop at the ends");
+
+            // ── Питание в меню приложений ──
+            string exe, args;
+            Check(string.Join(",", SessionRules.Kinds) == "shutdown,restart,sleep,lock", "four power buttons");
+            Check(SessionRules.Command("shutdown", out exe, out args) && exe == "shutdown.exe" && args == "/s /t 0", "shutdown is shutdown.exe /s /t 0");
+            Check(SessionRules.Command("restart", out exe, out args) && exe == "shutdown.exe" && args == "/r /t 0", "restart is shutdown.exe /r /t 0");
+            Check(SessionRules.Command("sleep", out exe, out args) && exe == "rundll32.exe" && args == "powrprof.dll,SetSuspendState 0,1,0", "sleep goes through powrprof");
+            Check(SessionRules.Command("lock", out exe, out args) && exe == null && !SessionRules.Command("format", out exe, out args), "lock needs no program; an unknown command is refused");
+            Check(SessionRules.Confirm("shutdown") == "Точно выключить?" && SessionRules.Confirm("restart") == "Точно перезагрузить?" && SessionRules.Confirm("sleep") == null && SessionRules.Confirm("lock") == null, "only shutdown and restart ask twice");
+            Check(!Session.Armed && !Session.Run("lock") && !Session.Run("shutdown"), "a self-test never locks, sleeps or shuts down the computer");
         }
     }
 }

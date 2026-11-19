@@ -1,7 +1,9 @@
 // dock.txt. DockWindow.cs — сам док: стеклянная полоса внизу экрана. Слева — кнопка меню приложений, за ней значки
 // (точки под запущенными, красные счётчики непрочитанного), справа за чертой — виджеты: музыка, календарь, погода,
 // громкость, батарея, часы. Увеличение под курсором, подпись над значком, автоскрытие, меню по правому щелчку.
-// Окно прозрачное и шире полосы: увеличенным значкам и подписи нужно место. Прозрачные места щелчки пропускают.
+// Значки и виджеты живут, пока они есть в доке: когда что-то меняется (минута, громкость, песня, открыли или закрыли
+// окно), док не собирается заново — меняется только то, что изменилось, новое проявляется, ушедшее гаснет,
+// соседи плавно съезжаются. Окно прозрачное, во всю ширину экрана; прозрачные места щелчки пропускают.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -25,18 +27,26 @@ namespace DevTxt.DockApp
     class Slot
     {
         public SlotKind Kind;
+        public string Id;                 // по нему место узнаётся между перерисовками: «item:путь», «widget:clock», «line:split»
         public DockItem Item;             // для значка приложения
         public string Widget;             // для виджета: music, calendar, weather, volume, battery, clock
         public string Tip;                // подпись виджета
-        public Action<bool> Hover;        // показать или спрятать то, что видно только под курсором (кнопки музыки)
-        public FrameworkElement Root;
-        public Ellipse Dot;
+        public Action<bool> Hover;        // показать или спрятать то, что видно только под курсором (подсветка, кнопки музыки)
+        public Action Update;             // виджет: обновить содержимое на месте — текст, значок
+        public FrameworkElement Root, Badge;
+        public string BadgeText;
+        public Border Dot;
         public readonly ScaleTransform Scale = new ScaleTransform(1, 1);
         public readonly TranslateTransform Move = new TranslateTransform(), DotMove = new TranslateTransform();
-        public double W, Left, Now = 1;   // ширина в покое, где стоит и во сколько раз увеличен прямо сейчас
+        public double W, Left, Centre, CellL, CellR, Now = 1;   // ширина в покое; где стоит и во сколько раз увеличен прямо сейчас
+        public double Built;              // для какого размера значков собрано
+        public bool Tight, Leaving;       // Leaving — уже не нужен, гаснет и освобождает место
+        // Всё, что меняется плавно: присутствие (0 — нет, 1 — есть), ширина, нажатие, ширина точки под значком
+        public readonly Tween Show = new Tween(1), Wide = new Tween(0), Press = new Tween(1), DotW = new Tween(0);
+        public long BounceAt = -1;        // когда значок начал подпрыгивать (программа запускается); −1 — не прыгает
+        public int BounceStop = -1;       // после какого прыжка остановиться: окно появилось
 
         public bool Icon { get { return Kind == SlotKind.Item || Kind == SlotKind.Launcher; } }
-        public string Id { get { return Kind == SlotKind.Item ? "item:" + Item.Key : Kind == SlotKind.Widget ? "widget:" + Widget : Kind.ToString(); } }
     }
 
     class DockWindow : Window
@@ -45,11 +55,15 @@ namespace DevTxt.DockApp
         internal static readonly string[] DockSprite = { "....####....", "....#E##....", ".##.#E##.##.", ".##.####.##.", ".##.####.##.", "............", "############", ".##########." };
 
         // Свои размеры дока — то, чего в токенах нет
-        const double PadH = 6, PadTop = 9, DotZone = 12, EdgeGap = 8, TipGap = 9, TipH = 26, TopRoom = 12, DotSize = 4;
+        const double PadH = 6, PadTop = 9, DotZone = 12, EdgeGap = 8, TipGap = 9, TipH = 26, TopRoom = 12, DotSize = 4, DotWide = 14;
         const double WidgetTipGap = 5, TipMaxH = 92;   // подпись виджета бывает в несколько строк (события календаря)
         const double MusicText = 180, CalendarText = 190, MusicTextTight = 110, CalendarTextTight = 120;
         internal const double MaxScale = 1.55, RangeSlots = 2.6;
-        const int HideAfterMs = 700, EdgeMs = 100, SlowPollTicks = 5;
+        const int HideAfterMs = 700, EdgeMs = 50, SlowPollTicks = 5;
+        // Движение: появление и переезд значков, уход, нажатие (вниз быстро, обратно мягко), прыжок при запуске, виджеты
+        const int AppearMs = 250, LeaveMs = 180, PressDownMs = 70, PressUpMs = 220, BounceMs = 560, BounceCycles = 3, WidgetFadeMs = 120;
+        const double PressScale = 0.92, BounceHeight = 0.2;
+        const int MenuTitleChars = 38;
         const string AppsTip = "Приложения";
 
         readonly bool demo, headless;
@@ -57,6 +71,7 @@ namespace DevTxt.DockApp
         readonly Canvas stage = new Canvas();
         readonly TranslateTransform slide = new TranslateTransform();
         readonly Border panel, tip;
+        readonly Rectangle strip;
         readonly TextBlock tipText;
         readonly DispatcherTimer refresh = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         readonly DispatcherTimer edge = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(EdgeMs) };
@@ -67,9 +82,11 @@ namespace DevTxt.DockApp
 
         List<DockItem> items = new List<DockItem>();
         readonly List<Slot> slots = new List<Slot>();
+        readonly Dictionary<IntPtr, string> demoTitles = new Dictionary<IntPtr, string>();
         string signature;
-        double size, gap, winW, winH, restW, baseline, panelTop, panelLeft, panelRight;
-        double[] rest = new double[0];
+        double size, gap, winW, winH, restW, baseline, panelTop, panelLeft, panelRight, lastHiddenY = double.NaN;
+        IntPtr fg;        // окно, которое сейчас впереди: под его значком точка шире и ярче
+        Slot pressed;     // значок или виджет, на котором сейчас держат кнопку мыши
 
         // Виджеты: что пришло из хаба от kapsula.txt и что док узнал у Windows сам
         MediaInfo media;
@@ -79,7 +96,7 @@ namespace DevTxt.DockApp
         BatteryInfo battery = BatteryInfo.From(0, 255, 255);
         readonly Dictionary<string, string> hubRaw = new Dictionary<string, string>();
         Audio audio;
-        bool hasVolume, volMuted, widgetsDirty, ended;
+        bool hasVolume, volMuted, widgetsDirty, ended, fgPending;
         volatile bool volPending;
         double volLevel;
         int ticks;
@@ -88,7 +105,7 @@ namespace DevTxt.DockApp
 
         // Увеличение: одна пружина от 0 (покой) до 1 (курсор над доком). Сами значки идут за курсором без задержки.
         double amount, velocity, cursorU, lastU = double.NaN, lastAmount = double.NaN;
-        bool looping, inside, menuOpen, hidden, fullscreen;
+        bool looping, inside, menuOpen, hidden, fullscreen, away, moving;
         int hover = -1, edgeHits;
         long lastFrame, lastInside;
         string tipOverride;
@@ -115,10 +132,14 @@ namespace DevTxt.DockApp
             panel = new Border
             {
                 // Тот же чёрный, что у острова kapsula.txt наверху: верх и низ экрана — один набор, а не два разных
-                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.Solid(Tokens.Dark.Bg), SnapsToDevicePixels = true,
+                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.Solid(Tokens.Dark.Bg), SnapsToDevicePixels = true, IsHitTestVisible = false,
                 Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 22, ShadowDepth = 5, Direction = 270, Opacity = 0.38, Color = Colors.Black },
                 Child = new Border { CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Brushes.Transparent, BorderBrush = Ui.Rim, BorderThickness = new Thickness(1) }
             };
+            // Одна полоса на все щелчки: от верха выросших значков до нижнего края экрана. Столбец под значком — это тот же
+            // значок, поэтому курсор, упёртый в край экрана, попадает в цель. Полоса почти прозрачная, но не совсем:
+            // совсем прозрачные точки Windows отдаёт окну под доком.
+            strip = new Rectangle { Fill = Ui.Solid(Color.FromArgb(1, 0, 0, 0)) };
             tipText = Ui.T("", Tokens.Size.Caption, Ui.Label, FontWeights.SemiBold);
             tipText.VerticalAlignment = VerticalAlignment.Center;
             tipText.TextTrimming = TextTrimming.None;
@@ -127,11 +148,26 @@ namespace DevTxt.DockApp
                 MinHeight = TipH, CornerRadius = new CornerRadius(Tokens.Radius.Tip), Background = Ui.Solid(Tokens.Dark.Tooltip), BorderBrush = Ui.Rim, BorderThickness = new Thickness(1),
                 Padding = new Thickness(10, 4, 10, 5), Child = tipText, Opacity = 0, IsHitTestVisible = false, SnapsToDevicePixels = true
             };
+            // Снизу вверх: полоса, поле для щелчков, черты и виджеты, точки, значки, подпись
+            Panel.SetZIndex(strip, 1);
+            Panel.SetZIndex(tip, 9);
+            stage.Children.Add(panel);
+            stage.Children.Add(strip);
+            stage.Children.Add(tip);
             stage.RenderTransform = slide;
             Content = stage;
 
             stage.MouseMove += delegate { StartLoop(); };
-            panel.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; OpenMenu(null); };
+            strip.MouseDown += StripDown;
+            strip.MouseUp += StripUp;
+            strip.MouseLeave += delegate { Release(); };
+            strip.MouseWheel += delegate(object s, MouseWheelEventArgs e)
+            {
+                Slot at = SlotAt(e.GetPosition(this).X);
+                if (at == null || at.Widget != "volume") return;
+                e.Handled = true;
+                VolumeWheel(e.Delta);
+            };
             SourceInitialized += delegate
             {
                 IntPtr me = new WindowInteropHelper(this).Handle;
@@ -143,6 +179,8 @@ namespace DevTxt.DockApp
                     return IntPtr.Zero;
                 });
             };
+            // Окно показали, а дока сейчас быть не должно (игра на весь экран, выбрана панель Windows) — сразу убираем
+            ContentRendered += delegate { if (away && !headless) Hide(); };
 
             if (demo)
             {
@@ -153,6 +191,7 @@ namespace DevTxt.DockApp
             {
                 hub = new DockHub(this, store);
                 items = Collect();
+                fg = Win.Foreground();
                 // Громкость: Windows сама сообщает об изменениях (в своём потоке) — опрашивать её не нужно
                 audio = Audio.Open(delegate
                 {
@@ -180,6 +219,8 @@ namespace DevTxt.DockApp
                 taskbarTimer.Start();
                 hookTimer.Tick += delegate { WinKey.Refresh(); };
                 hookTimer.Start();
+                // Впереди стало другое окно — узнаём сразу, а не через секунду
+                if (!headless) Win.WatchForeground(ForegroundChanged);
                 AppCatalog.Refresh(null);   // список для меню приложений собирается заранее, в фоне
             }
         }
@@ -194,12 +235,21 @@ namespace DevTxt.DockApp
         {
             if (demo || headless) return;
             if (store.ReplaceTaskbar) TaskbarSwap.Take(store.Dir); else TaskbarSwap.Give(store.Dir);
-            WinKey.Sync(store.ReplaceTaskbar && store.WinKey, Dispatcher, delegate { if (!ended) ToggleApps(); });
+            WinKey.Sync(store.ReplaceTaskbar && store.WinKey, Dispatcher, WinPressed);
             // Компактная панель Windows: включаем, только когда её выбрали; иначе возвращаем, как было до нас
             bool changed = store.Bar == "modern" ? TaskbarSwap.CompactOn(store.Dir) : TaskbarSwap.CompactBack(store.Dir);
             if (changed) TaskbarSwap.RestartExplorer(null);   // Проводник не закрылся сам — не трогаем: панель сменится при следующем входе
             // Выбрана панель Windows — дока не видно (он остаётся запущенным: настройки, счётчики, меню приложений)
-            if (store.Bar == "modern") Hide(); else if (!fullscreen) Show();
+            SyncAway();
+        }
+
+        // Одиночное нажатие кнопки Windows. Поверх игры или видео на весь экран меню приложений не открываем
+        // (закрыть уже открытое — можно).
+        void WinPressed()
+        {
+            if (ended) return;
+            if (appMenu == null && Win.FullscreenAhead()) return;
+            ToggleApps();
         }
 
         // Всё, что тикает и слушает, останавливается один раз
@@ -208,6 +258,8 @@ namespace DevTxt.DockApp
             if (ended) return;
             ended = true;
             refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop();
+            StopLoop();
+            Win.Unwatch();
             // Док уходит — панель задач и кнопка Windows возвращаются такими, какими были
             WinKey.Stop();
             if (!demo && !headless) TaskbarSwap.Give(store.Dir);
@@ -231,15 +283,16 @@ namespace DevTxt.DockApp
             return Logic.Group(store.Pins, Win.Taskbar(), store.ShowRunning, Shell.NameOf);
         }
 
-        // Раз в секунду: смотрим на окна и перерисовываем док, только если что-то изменилось.
+        // Раз в секунду (и сразу, когда впереди стало другое окно): смотрим на окна и меняем док, только если что-то изменилось.
         // Раз в пять секунд заодно — батарея и не сменилось ли устройство звука.
         void Refresh()
         {
             bool full = Win.FullscreenAhead();
+            fg = Win.Foreground();
             if (full != fullscreen)
             {
-                fullscreen = full;   // игра или видео на весь экран — дока нет совсем
-                if (!headless) { if (full || store.Bar == "modern") Hide(); else Show(); }
+                fullscreen = full;   // игра или видео на весь экран — док уезжает за край
+                SyncAway();
             }
             if (++ticks % SlowPollTicks == 0)
             {
@@ -259,10 +312,21 @@ namespace DevTxt.DockApp
                 hub.PublishApps(items);
                 return;
             }
-            // Те же значки — обновляем только списки окон
+            // Те же значки — обновляем только списки окон и точки под значками
             items = now;
-            int n = 0;
-            foreach (var s in slots) if (s.Kind == SlotKind.Item) s.Item = items[n++];
+            foreach (DockItem item in items)
+            {
+                Slot s = Find("item:" + item.Key);
+                if (s != null) s.Item = item;
+            }
+            SyncDots();
+        }
+
+        void ForegroundChanged()
+        {
+            if (fgPending || ended) return;
+            fgPending = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate { fgPending = false; if (!ended) Refresh(); }));
         }
 
         // Часы идут раз в минуту, ровно на её границе
@@ -303,8 +367,8 @@ namespace DevTxt.DockApp
             if (ReadVolume()) Rebuild();
         }
 
-        // Щелчок по виджету громкости: звук выключается и включается
-        void VolumeClick()
+        // Средняя кнопка на виджете громкости: звук выключается и включается
+        void VolumeMute()
         {
             if (demo || audio == null || !hasVolume) return;
             audio.Mute(!volMuted);
@@ -362,6 +426,50 @@ namespace DevTxt.DockApp
         }
 
         // ───────── Разметка ─────────
+        // Двигать ли: окно настоящее и на экране, «Меньше движения» выключено. В снимке и без окна всё встаёт на место сразу.
+        bool CanAnimate { get { return !Ui.ReducedMotion && IsVisible && PresentationSource.FromVisual(this) != null; } }
+
+        void Go(Tween t, double value, int ms)
+        {
+            if (CanAnimate) t.Go(value, clock.ElapsedMilliseconds, ms); else t.Set(value);
+        }
+
+        // Что-то начало меняться: пусть идут кадры. Двигать нельзя — просто расставляем заново.
+        void Kick()
+        {
+            if (CanAnimate) StartLoop(); else Place(true);
+        }
+
+        static void Fade(UIElement e, double to, int ms)
+        {
+            if (!Ui.Live(e))
+            {
+                e.BeginAnimation(OpacityProperty, null);
+                e.Opacity = to;
+                return;
+            }
+            e.BeginAnimation(OpacityProperty, new DoubleAnimation(to, TimeSpan.FromMilliseconds(ms)) { EasingFunction = Ui.EaseOut });
+        }
+
+        Slot Find(string id)
+        {
+            Slot leaving = null;
+            foreach (Slot s in slots)
+            {
+                if (s.Id != id) continue;
+                if (!s.Leaving) return s;
+                leaving = s;   // уходящий годится, только если живого с таким именем нет: его можно вернуть
+            }
+            return leaving;
+        }
+
+        // То же место из прошлого раза, если оно собрано для того же размера значков
+        Slot Reuse(string id)
+        {
+            Slot s = Find(id);
+            return s != null && s.Built == size ? s : null;
+        }
+
         // Значок программы; если его нет — цветная плитка с первой буквой, как в core.txt
         FrameworkElement Face(DockItem item)
         {
@@ -377,142 +485,266 @@ namespace DevTxt.DockApp
 
         Slot IconSlot(DockItem item)
         {
-            var slot = new Slot { Kind = SlotKind.Item, Item = item, W = size };
-            var root = new Grid { Width = size, Height = size, Background = Brushes.Transparent, RenderTransformOrigin = new Point(0.5, 1), Children = { Face(item) } };
-            string badge = UnreadInfo.Text(BadgeFor(item));
-            if (badge != null) root.Children.Add(Glyphs.Badge(badge, size));
+            var slot = new Slot { Kind = SlotKind.Item, Id = "item:" + item.Key, Item = item, W = size, Built = size };
+            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { Face(item) } };
             root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
             slot.Root = root;
-            slot.Dot = new Ellipse { Width = DotSize, Height = DotSize, Fill = Ui.Label2, RenderTransform = slot.DotMove, IsHitTestVisible = false, Visibility = item.Running ? Visibility.Visible : Visibility.Collapsed };
-            Wire(slot, delegate { Clicked(slot.Item, false); }, delegate { Clicked(slot.Item, true); });
+            slot.Dot = new Border { Width = 0, Height = DotSize, CornerRadius = new CornerRadius(DotSize / 2), Background = Ui.Label, RenderTransform = slot.DotMove, IsHitTestVisible = false };
+            Refit(slot, item);
             return slot;
+        }
+
+        // Значок остался тем же, а программа могла измениться: окна, счётчик непрочитанного
+        void Refit(Slot slot, DockItem item)
+        {
+            slot.Item = item;
+            string badge = UnreadInfo.Text(BadgeFor(item));
+            if (badge == slot.BadgeText) return;
+            var root = (Grid)slot.Root;
+            if (slot.Badge != null) root.Children.Remove(slot.Badge);
+            slot.Badge = badge == null ? null : Glyphs.Badge(badge, size);
+            if (slot.Badge != null)
+            {
+                root.Children.Add(slot.Badge);
+                if (slot.BadgeText == null) Motion.Pop(slot.Badge);   // счётчик появился — выскакивает; сменилась цифра — просто меняется
+            }
+            slot.BadgeText = badge;
         }
 
         // Кнопка меню приложений: пиксельный значок дока на стеклянной плитке из kit.txt
         Slot LauncherSlot()
         {
-            var slot = new Slot { Kind = SlotKind.Launcher, W = size };
+            var slot = new Slot { Kind = SlotKind.Launcher, Id = "launcher", W = size, Built = size };
             var tile = new Viewbox { Width = size * 0.92, Height = size * 0.92, Child = Ui.Tile(Ui.Sprite(DockSprite, 34)), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-            var root = new Grid { Width = size, Height = size, Background = Brushes.Transparent, RenderTransformOrigin = new Point(0.5, 1), Children = { tile } };
+            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { tile } };
             root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
             slot.Root = root;
-            Wire(slot, delegate { ToggleApps(); }, null);
             return slot;
         }
 
-        Slot LineSlot()
+        Slot LineSlot(string id)
         {
             var line = new Rectangle { Width = 1, Height = Math.Round(size * 0.72), Fill = Ui.Fill2, IsHitTestVisible = false };
-            var slot = new Slot { Kind = SlotKind.Line, Root = line, W = 1 };
+            var slot = new Slot { Kind = SlotKind.Line, Id = id, Root = line, W = 1, Built = size };
             line.RenderTransform = slot.Move;
             return slot;
         }
 
-        FrameworkElement MediaButton(string action, double h, double glyph)
+        Border MediaButton(string action, double h)
         {
-            var b = new Border { Width = h + 2, Height = h - 6, CornerRadius = new CornerRadius((h - 6) / 2), Background = Brushes.Transparent, Child = Glyphs.Media(action, media != null && media.Playing, glyph) };
+            var b = new Border { Width = h + 2, Height = h - 6, CornerRadius = new CornerRadius((h - 6) / 2), Background = Brushes.Transparent };
             b.MouseEnter += delegate { b.Background = Ui.Fill2; };
             b.MouseLeave += delegate { b.Background = Brushes.Transparent; };
-            b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
-            b.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; WidgetAction("music", action); };
+            b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; b.Background = Ui.Press; };
+            b.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; b.Background = Ui.Fill2; WidgetAction("music", action); };
             return b;
         }
 
         // Виджет: стеклянная капсула в виде дока. tight — места мало, длинные надписи короче.
+        // Собирается один раз; дальше slot.Update меняет в нём только то, что изменилось.
         Slot WidgetSlot(string id, bool tight)
         {
             double h = Math.Round(Math.Max(24, Math.Min(34, size * 0.64)));
             double font = h >= 28 ? Tokens.Size.Body : Tokens.Size.Caption, glyph = Math.Round(h * 0.56), pad = Math.Round(h * 0.38), space = Math.Round(h * 0.22);
-            var slot = new Slot { Kind = SlotKind.Widget, Widget = id };
+            var slot = new Slot { Kind = SlotKind.Widget, Id = "widget:" + id, Widget = id, Built = size, Tight = tight };
             var row = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            Action<FrameworkElement> icon = delegate(FrameworkElement g) { g.Margin = new Thickness(g.Margin.Left, 0, space, 0); row.Children.Add(g); };
-            Func<string, Brush, TextBlock> text = delegate(string t, Brush color)
+            // Значок меняется только вместе со своим «отпечатком»: стало больше дуг у динамика, сменилась погода
+            var iconHost = new Border { Margin = new Thickness(0, 0, space, 0), VerticalAlignment = VerticalAlignment.Center };
+            string iconNow = null;
+            Action<string, Func<FrameworkElement>> icon = delegate(string mark, Func<FrameworkElement> make)
             {
-                TextBlock tb = Ui.T(t, font, color, FontWeights.SemiBold);
-                tb.VerticalAlignment = VerticalAlignment.Center;
-                tb.Margin = new Thickness(0, 0, 0, 1);
-                return tb;
+                if (mark == iconNow) return;
+                iconNow = mark;
+                iconHost.Child = make();
             };
-            UIElement content = row;
-            DateTime now = Today;
+            TextBlock label = Ui.T("", font, Ui.Label, FontWeights.SemiBold);
+            label.VerticalAlignment = VerticalAlignment.Center;
+            label.Margin = new Thickness(0, 0, 0, 1);
+            // Цифры меняются, а ширина — нет: док не дёргается под колесом и на смене минуты
+            Action<string> widest = delegate(string sample)
+            {
+                TextBlock probe = Ui.T(sample, font, Ui.Label, FontWeights.SemiBold);
+                probe.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                label.MinWidth = Math.Ceiling(probe.DesiredSize.Width);
+            };
+            if (id != "clock") row.Children.Add(iconHost);
+            Panel over = null;      // то, что лежит поверх капсулы и принимает щелчки само: кнопки музыки
+            Action<bool> extra = null;
+            Action fill;
 
             if (id == "music")
             {
-                icon(Glyphs.Playing(media.Playing, Math.Round(glyph * 0.78)));
-                TextBlock t = text(media.Line, Ui.Label);
-                t.MaxWidth = tight ? MusicTextTight : MusicText;
-                row.Children.Add(t);
-                var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Visibility = Visibility.Collapsed };
-                foreach (string a in new string[] { "prev", "toggle", "next" }) buttons.Children.Add(MediaButton(a, h, Math.Round(glyph * 0.82)));
-                row.HorizontalAlignment = HorizontalAlignment.Center;
-                content = new Grid { MinWidth = 3 * (h + 2), Children = { row, buttons } };
-                slot.Hover = delegate(bool on) { row.Opacity = on ? 0 : 1; buttons.Visibility = on ? Visibility.Visible : Visibility.Collapsed; };
-                slot.Tip = media.Tip;
+                double textW = tight ? MusicTextTight : MusicText;
+                label.Width = textW;   // название любой длины — та же ширина: соседи не ездят от песни к песне
+                row.Children.Add(label);
+                var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                var faces = new Dictionary<string, Border>();
+                foreach (string a in new string[] { "prev", "toggle", "next" })
+                {
+                    Border b = MediaButton(a, h);
+                    b.Child = Glyphs.Media(a, false, Math.Round(glyph * 0.82));
+                    faces[a] = b;
+                    buttons.Children.Add(b);
+                }
+                over = new Grid { Width = textW, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, pad + 1, 0), Opacity = 0, IsHitTestVisible = false, Children = { buttons } };
+                Panel overNow = over;
+                string playNow = null;
+                extra = delegate(bool on)
+                {
+                    // Под курсором название уступает место кнопкам; значок слева остаётся
+                    Fade(label, on ? 0 : 1, WidgetFadeMs);
+                    Fade(overNow, on ? 1 : 0, WidgetFadeMs);
+                    overNow.IsHitTestVisible = on;
+                };
+                fill = delegate
+                {
+                    bool playing = media.Playing;
+                    icon(playing ? "play" : "pause", delegate { return Glyphs.Playing(playing, Math.Round(glyph * 0.78)); });
+                    if (playNow != (playing ? "1" : "0"))
+                    {
+                        playNow = playing ? "1" : "0";
+                        faces["toggle"].Child = Glyphs.Media("toggle", playing, Math.Round(glyph * 0.82));
+                    }
+                    if (label.Text != media.Line) label.Text = media.Line;   // без движения: под курсором название спрятано за кнопками
+                    slot.Tip = media.Tip;
+                };
             }
             else if (id == "calendar")
             {
-                List<CalendarEvent> left = calendar.Remaining(now.Hour * 60 + now.Minute);
-                icon(Glyphs.Calendar(glyph));
-                TextBlock t = text("", Ui.Label);
-                if (left[0].When.Length > 0) t.Inlines.Add(new Run(left[0].When));
-                if (left[0].Title.Length > 0) t.Inlines.Add(new Run((left[0].When.Length > 0 ? "  " : "") + left[0].Title) { Foreground = Ui.Label2, FontWeight = FontWeights.Normal });
-                t.MaxWidth = tight ? CalendarTextTight : CalendarText;
-                row.Children.Add(t);
-                slot.Tip = CalendarInfo.Tip(left);
+                label.MaxWidth = tight ? CalendarTextTight : CalendarText;
+                row.Children.Add(label);
+                icon("calendar", delegate { return Glyphs.Calendar(glyph); });
+                string lineNow = null;
+                fill = delegate
+                {
+                    DateTime now = Today;
+                    List<CalendarEvent> left = calendar.Remaining(now.Hour * 60 + now.Minute);
+                    string line = left[0].When + "\n" + left[0].Title;
+                    if (line != lineNow)
+                    {
+                        lineNow = line;
+                        label.Inlines.Clear();
+                        if (left[0].When.Length > 0) label.Inlines.Add(new Run(left[0].When));
+                        if (left[0].Title.Length > 0) label.Inlines.Add(new Run((left[0].When.Length > 0 ? "  " : "") + left[0].Title) { Foreground = Ui.Label2, FontWeight = FontWeights.Normal });
+                    }
+                    slot.Tip = CalendarInfo.Tip(left);
+                };
             }
             else if (id == "weather")
             {
-                icon(Glyphs.Weather(weather.Icon, glyph + 2));
-                row.Children.Add(text(weather.TempText, Ui.Label));
-                slot.Tip = weather.Tip;
+                row.Children.Add(label);
+                fill = delegate
+                {
+                    string kind = weather.Icon;
+                    icon(kind, delegate { return Glyphs.Weather(kind, glyph + 2); });
+                    Motion.Swap(label, weather.TempText);
+                    slot.Tip = weather.Tip;
+                };
             }
             else if (id == "volume")
             {
-                icon(Glyphs.Volume(VolumeMath.Bars(volLevel, volMuted), volMuted, glyph + 1));
-                TextBlock t = text(VolumeMath.Percent(volLevel) + "%", volMuted ? Ui.Label3 : Ui.Label), widest = text("00%", Ui.Label);
-                widest.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                t.MinWidth = Math.Ceiling(widest.DesiredSize.Width);   // от 0 до 99 капсула не меняет ширину — док не дёргается под колесом
-                row.Children.Add(t);
-                slot.Tip = VolumeMath.Tip(volLevel, volMuted);
+                widest("00%");
+                row.Children.Add(label);
+                fill = delegate
+                {
+                    int bars = VolumeMath.Bars(volLevel, volMuted);
+                    bool muted = volMuted;
+                    icon(bars + (muted ? "m" : ""), delegate { return Glyphs.Volume(bars, muted, glyph + 1); });
+                    label.Text = VolumeMath.Percent(volLevel) + "%";
+                    label.Foreground = muted ? Ui.Label3 : Ui.Label;
+                    slot.Tip = VolumeMath.Tip(volLevel, volMuted);
+                };
             }
             else if (id == "battery")
             {
-                icon(Glyphs.Battery(battery.Percent, battery.Charging, Math.Round(h * 0.4)));
-                row.Children.Add(text(battery.Percent + "%", Ui.Label));
-                slot.Tip = battery.Tip;
+                row.Children.Add(label);
+                fill = delegate
+                {
+                    int percent = battery.Percent;
+                    bool charging = battery.Charging;
+                    icon(percent + (charging ? "c" : ""), delegate { return Glyphs.Battery(percent, charging, Math.Round(h * 0.4)); });
+                    label.Text = percent + "%";
+                    slot.Tip = battery.Tip;
+                };
             }
             else
             {
-                row.Children.Add(text(now.ToString("HH:mm", CultureInfo.InvariantCulture), Ui.Label));
-                slot.Tip = now.ToString("dddd, d MMMM yyyy", new CultureInfo("ru-RU"));
+                widest("00:00");
+                label.TextAlignment = TextAlignment.Center;
+                row.Children.Add(label);
+                fill = delegate
+                {
+                    DateTime now = Today;
+                    label.Text = now.ToString("HH:mm", CultureInfo.InvariantCulture);
+                    slot.Tip = now.ToString("dddd, d MMMM yyyy", new CultureInfo("ru-RU"));
+                };
             }
 
-            Border capsule = Glyphs.Capsule(content, h, pad);
-            capsule.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-            slot.W = Math.Ceiling(capsule.DesiredSize.Width);
-            var root = new Grid { Width = slot.W, Height = size, Background = Brushes.Transparent, RenderTransform = slot.Move, Children = { capsule } };
-            root.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; OpenMenu(null); };
-            if (id == "volume")
+            Border capsule = Glyphs.Capsule(row, h, pad);
+            capsule.IsHitTestVisible = false;   // щелчки по виджету ловит общая полоса дока, как и по значкам
+            // Подсветка под курсором — у каждой капсулы: видно, что она нажимается
+            var glow = new Border { Height = h, CornerRadius = new CornerRadius(h / 2), Background = Ui.Solid(Ui.Alpha(Colors.White, 0.07)), Opacity = 0, IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Center };
+            var root = new Grid { Height = size, RenderTransformOrigin = new Point(0.5, 0.5), Children = { capsule, glow } };
+            root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
+            if (over != null)
             {
-                root.MouseWheel += delegate(object s, MouseWheelEventArgs e) { e.Handled = true; VolumeWheel(e.Delta); };
-                root.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
-                root.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; VolumeClick(); };
+                root.Children.Add(over);
+                root.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; OpenMenu(null); };
             }
             slot.Root = root;
+            slot.Hover = delegate(bool on)
+            {
+                Fade(glow, on ? 1 : 0, WidgetFadeMs);
+                if (extra != null) extra(on);
+            };
+            slot.Update = delegate
+            {
+                fill();
+                capsule.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                slot.W = Math.Ceiling(capsule.DesiredSize.Width);
+                root.Width = slot.W;
+            };
+            slot.Update();
             return slot;
         }
 
+        // Виджеты для этого размера значков: те, что уже стоят в доке, обновляются на месте
         List<Slot> WidgetSlots(List<string> ids, bool tight)
         {
             var list = new List<Slot>();
-            foreach (string id in ids) list.Add(WidgetSlot(id, tight));
+            foreach (string id in ids)
+            {
+                Slot s = Reuse("widget:" + id);
+                if (s != null && s.Tight == tight) s.Update(); else s = WidgetSlot(id, tight);
+                list.Add(s);
+            }
             return list;
         }
 
+        void Mount(Slot s)
+        {
+            Panel.SetZIndex(s.Root, s.Icon ? 4 : 2);
+            stage.Children.Add(s.Root);
+            if (s.Dot == null) return;
+            Panel.SetZIndex(s.Dot, 3);
+            stage.Children.Add(s.Dot);
+        }
+
+        void Unmount(Slot s)
+        {
+            stage.Children.Remove(s.Root);
+            if (s.Dot != null) stage.Children.Remove(s.Dot);
+            if (pressed == s) pressed = null;
+        }
+
+        // Приводит док к тому, что должно быть видно сейчас. Ничего не сносит: места, которые остались, остаются
+        // теми же самыми (в них меняется только содержимое), новые проявляются, лишние гаснут и освобождают место.
         void Rebuild()
         {
-            // Что было под курсором — чтобы подпись не моргала, когда док перерисовывается (сменилась минута, покрутили громкость)
-            string keep = hover >= 0 && hover < slots.Count && !menuOpen ? slots[hover].Id : null;
+            // Что было под курсором — чтобы подпись и кнопки музыки не пропадали, когда док меняется (минута, громкость)
+            Slot keep = hover >= 0 && hover < slots.Count && !menuOpen ? slots[hover] : null;
+            long tick = clock.ElapsedMilliseconds;
+            double sizeBefore = size;
             widgetsDirty = false;
             signature = Logic.Signature(items);
             int count = items.Count + 1;   // значки и кнопка меню приложений
@@ -547,33 +779,61 @@ namespace DevTxt.DockApp
             }
             shown = ids;
 
-            stage.Children.Clear();
-            slots.Clear();
-            stage.Children.Add(panel);
-            slots.Add(LauncherSlot());
+            // Размер значков сменился — всё собирается заново и встаёт сразу; иначе перемены идут плавно
+            bool animate = slots.Count > 0 && size == sizeBefore && CanAnimate;
+            var next = new List<Slot>();
+            next.Add(Reuse("launcher") ?? LauncherSlot());
             bool lineDone = false;
             foreach (var item in items)
             {
                 if (split && !item.Pinned && !lineDone)
                 {
                     lineDone = true;
-                    slots.Add(LineSlot());
+                    next.Add(Reuse("line:split") ?? LineSlot("line:split"));
                 }
-                slots.Add(IconSlot(item));
+                Slot s = Reuse("item:" + item.Key);
+                if (s != null) Refit(s, item); else s = IconSlot(item);
+                next.Add(s);
             }
-            if (widgets.Count > 0) slots.Add(LineSlot());
-            slots.AddRange(widgets);
-            // Черты и виджеты — на полосе, точки — под значками, значки — поверх, подпись — над всем
-            foreach (var s in slots) if (!s.Icon) stage.Children.Add(s.Root);
-            foreach (var s in slots) if (s.Icon) { if (s.Dot != null) stage.Children.Add(s.Dot); stage.Children.Add(s.Root); }
-            stage.Children.Add(tip);
+            if (widgets.Count > 0) next.Add(Reuse("line:widgets") ?? LineSlot("line:widgets"));
+            next.AddRange(widgets);
 
-            rest = new double[slots.Count];
-            restW = 0;
-            for (int i = 0; i < slots.Count; i++) { rest[i] = slots[i].W; restW += rest[i] + gap; }
+            // Уходящие остаются на своих местах, пока гаснут: каждый — сразу за прежним соседом слева
+            var merged = new List<Slot>(next);
+            for (int i = 0; i < slots.Count; i++)
+            {
+                Slot old = slots[i];
+                if (next.Contains(old)) continue;
+                if (!animate) { Unmount(old); continue; }
+                if (!old.Leaving)
+                {
+                    old.Leaving = true;
+                    old.Show.Go(0, tick, LeaveMs);
+                    if (old.Hover != null) old.Hover(false);
+                }
+                int at = 0;
+                for (int j = i - 1; j >= 0; j--)
+                {
+                    int k = merged.IndexOf(slots[j]);
+                    if (k >= 0) { at = k + 1; break; }
+                }
+                merged.Insert(at, old);
+            }
+            foreach (Slot s in next)
+            {
+                bool fresh = !slots.Contains(s);
+                if (fresh) Mount(s);
+                if (!animate) { s.Leaving = false; s.Show.Set(1); s.Wide.Set(s.W); continue; }
+                if (fresh) { s.Show.Set(0); s.Wide.Set(s.W); }
+                if (fresh || s.Leaving) s.Show.Go(1, tick, AppearMs);
+                s.Leaving = false;
+                s.Wide.Go(s.W, tick, AppearMs);
+            }
+            slots.Clear();
+            slots.AddRange(merged);
 
             double panelH = PadTop + size + DotZone;
-            winW = Math.Min(work.Width, restW + 2 * PadH + size * 4 + 160);
+            winW = work.Width;
             winH = EdgeGap + panelH + Math.Max(size * (MaxScale - 1) + TipGap + TipH, WidgetTipGap + TipMaxH) + TopRoom;
             baseline = winH - EdgeGap - DotZone;
             panelTop = baseline - size - PadTop;
@@ -581,25 +841,47 @@ namespace DevTxt.DockApp
             Canvas.SetTop(panel, panelTop);
             stage.Width = winW; stage.Height = winH;
             Width = winW; Height = winH;
-            Left = work.Left + (work.Width - winW) / 2;
+            Left = work.Left;
             Top = work.Bottom - winH;
 
-            hover = -1; tipOverride = null;
-            tip.BeginAnimation(OpacityProperty, null);
-            tip.Opacity = 0;
+            SyncDots();
+            double full = 0;
+            foreach (Slot s in slots) if (!s.Leaving) full += s.W + gap;
             Point p;
-            cursorU = inside && CursorHere(out p) ? p.X - Origin : restW / 2;
-            lastU = lastAmount = double.NaN;
-            Place();
-            int again = keep == null ? -1 : slots.FindIndex(delegate(Slot s) { return s.Id == keep; });
-            if (again >= 0)
+            if (!(inside && CursorHere(out p))) cursorU = full / 2;
+            int again = keep == null ? -1 : slots.IndexOf(keep);
+            if (again >= 0 && slots[again].Leaving) again = -1;
+            hover = again;
+            if (hover < 0)
             {
-                hover = again;
-                if (slots[again].Hover != null) slots[again].Hover(true);
-                if (FillTip()) tip.Opacity = 1;
+                // То, что было под курсором, ушло — подпись гаснет, а не висит над чужим значком
+                if (keep != null && keep.Hover != null) keep.Hover(false);
+                tipOverride = null;
+                tip.BeginAnimation(OpacityProperty, null);
+                tip.Opacity = 0;
             }
-            if (hidden) { slide.BeginAnimation(TranslateTransform.YProperty, null); slide.Y = HiddenY; }
+            Place(true);
+            if (hover >= 0 && !menuOpen) { if (FillTip()) { tip.BeginAnimation(OpacityProperty, null); tip.Opacity = 1; } }
+            // Полоса спрятана за краем, а её высота изменилась — прячем заново, на новую глубину
+            if ((hidden || away) && HiddenY != lastHiddenY) { slide.BeginAnimation(TranslateTransform.YProperty, null); slide.Y = HiddenY; }
+            lastHiddenY = HiddenY;
+            if (animate) StartLoop();
             if (hub != null) hub.PublishWidgets(shown, Badges());
+        }
+
+        // Точка под значком: нет окон — нет точки; окно программы впереди — точка шире и ярче
+        void SyncDots()
+        {
+            bool any = false;
+            foreach (Slot s in slots)
+            {
+                if (s.Kind != SlotKind.Item || s.Dot == null || s.Item == null) continue;
+                double to = s.Leaving || !s.Item.Running ? 0 : fg != IntPtr.Zero && s.Item.Windows.Contains(fg) ? DotWide : DotSize;
+                if (to == s.DotW.Target) continue;
+                Go(s.DotW, to, AppearMs);
+                any = true;
+            }
+            if (any) Kick();
         }
 
         // Счётчики, которые сейчас нарисованы: для состояния dock.widgets
@@ -617,50 +899,136 @@ namespace DevTxt.DockApp
         double HiddenY { get { return winH - panelTop + 30; } }   // полоса с тенью целиком уходит за нижний край окна
         double Origin { get { return (winW - restW) / 2; } }      // левый край ряда в покое, в координатах окна
 
-        // Расставляет значки по текущим cursorU и amount
-        void Place()
+        // Середина места в покое, от левого края ряда — куда «поставить курсор» для снимка
+        double RestCentre(int index)
         {
-            if (cursorU == lastU && amount == lastAmount) return;
-            lastU = cursorU; lastAmount = amount;
+            double a = 0;
+            for (int i = 0; i < index; i++) a += slots[i].W + gap;
+            return a + (slots[index].W + gap) / 2;
+        }
+
+        void Place() { Place(false); }
+
+        // Расставляет значки по текущим cursorU и amount и по тому, что сейчас меняется плавно:
+        // появление и уход, ширина, нажатие, прыжок, точки
+        void Place(bool force)
+        {
+            long now = clock.ElapsedMilliseconds;
+            // Кто догас — уходит совсем
+            Slot under = hover >= 0 && hover < slots.Count ? slots[hover] : null;
+            for (int i = slots.Count - 1; i >= 0; i--)
+            {
+                Slot s = slots[i];
+                if (!s.Leaving || s.Show.Value(now) > 0 || s.Show.Running) continue;
+                Unmount(s);
+                slots.RemoveAt(i);
+                force = true;
+            }
+            if (under != null) hover = slots.IndexOf(under);
+
             int n = slots.Count;
-            var scale = new double[n];
+            bool busy = false;
+            double[] k = new double[n], w = new double[n], press = new double[n], dot = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                Slot s = slots[i];
+                if (s.Show.Running || s.Wide.Running || s.Press.Running || s.DotW.Running || s.BounceAt >= 0) busy = true;
+                k[i] = s.Show.Value(now); w[i] = s.Wide.Value(now); press[i] = s.Press.Value(now); dot[i] = s.DotW.Value(now);
+            }
+            if (!force && !busy && !moving && cursorU == lastU && amount == lastAmount) return;
+            moving = busy;
+            lastU = cursorU; lastAmount = amount;
+
+            double[] rw = new double[n], mw = new double[n], scale = new double[n];
+            double total = 0;
+            for (int i = 0; i < n; i++) { rw[i] = (w[i] + gap) * k[i]; total += rw[i]; }
+            restW = total;
             double a = 0, range = RangeSlots * (size + gap);
             for (int i = 0; i < n; i++)
             {
-                double centre = a + (rest[i] + gap) / 2;
+                double centre = a + rw[i] / 2;
                 scale[i] = !slots[i].Icon ? 1 : 1 + amount * (Magnify.Scale(cursorU - centre, range, MaxScale) - 1);
-                a += rest[i] + gap;
+                mw[i] = (w[i] * scale[i] + gap) * k[i];
+                a += rw[i];
             }
             double from, to;
-            double[] left = Magnify.Layout(rest, scale, gap, cursorU, out from, out to);
+            double[] cell = Magnify.Cells(rw, mw, cursorU, out from, out to);
             double origin = Origin;
             panelLeft = origin + from - PadH; panelRight = origin + to + PadH;
             Canvas.SetLeft(panel, panelLeft);
             panel.Width = Math.Max(0, panelRight - panelLeft);
+            double rise = amount * size * (MaxScale - 1) + 2;
+            Canvas.SetLeft(strip, panelLeft);
+            Canvas.SetTop(strip, panelTop - rise);
+            strip.Width = panel.Width;
+            strip.Height = Math.Max(0, winH - panelTop + rise);
+
             for (int i = 0; i < n; i++)
             {
                 Slot s = slots[i];
-                s.Left = origin + left[i]; s.Now = scale[i];
+                s.CellL = origin + cell[i]; s.CellR = s.CellL + mw[i];
+                s.Centre = (s.CellL + s.CellR) / 2;
+                s.Now = scale[i];
+                s.Left = s.Centre - w[i] * scale[i] / 2;
+                if (s.Root.Opacity != k[i]) s.Root.Opacity = k[i];
                 if (s.Kind == SlotKind.Line)
                 {
-                    s.Move.X = s.Left;
+                    s.Move.X = s.Centre - 0.5;
                     s.Move.Y = baseline - size + (size - ((Rectangle)s.Root).Height) / 2;
                     continue;
                 }
+                double grow = 0.6 + 0.4 * k[i];   // новый значок вырастает, уходящий — сжимается
                 if (s.Kind == SlotKind.Widget)
                 {
-                    s.Move.X = s.Left;
+                    s.Scale.ScaleX = s.Scale.ScaleY = (1 - (1 - press[i]) / 2) * grow;   // капсула широкая — сжимается вдвое слабее значка
+                    s.Move.X = s.Centre - s.W / 2;
                     s.Move.Y = baseline - size;
                     continue;
                 }
-                s.Scale.ScaleX = s.Scale.ScaleY = scale[i];
-                s.Move.X = s.Left + size * (scale[i] - 1) / 2;   // значок растёт от своего низа, поэтому сдвигаем на половину прироста
-                s.Move.Y = baseline - size;
+                s.Scale.ScaleX = s.Scale.ScaleY = scale[i] * press[i] * grow;
+                s.Move.X = s.Centre - size / 2;   // значок растёт от своего низа и от середины своего места
+                double y = baseline - size - size * scale[i] * grow * (1 - press[i]) / 2;   // нажатие сжимает к середине значка, а не к полу
+                if (s.BounceAt >= 0)
+                {
+                    long t = now - s.BounceAt;
+                    int hop = (int)(t / BounceMs);
+                    if (s.BounceStop < 0 && s.Item != null && s.Item.Running) s.BounceStop = hop + 1;   // окно появилось — допрыгиваем и встаём
+                    if (hop >= (s.BounceStop >= 0 ? Math.Min(BounceCycles, s.BounceStop) : BounceCycles) || Ui.ReducedMotion) { s.BounceAt = -1; s.BounceStop = -1; }
+                    else y -= size * BounceHeight * (1 - 0.2 * hop) * Tween.Bounce(t, BounceMs);
+                }
+                s.Move.Y = y;
                 if (s.Dot == null) continue;
-                s.DotMove.X = s.Left + size * scale[i] / 2 - DotSize / 2;
+                double dw = Math.Max(0, dot[i]);
+                s.Dot.Width = dw;
+                s.Dot.Opacity = k[i] * (0.72 + 0.28 * Math.Max(0, Math.Min(1, (dw - DotSize) / (DotWide - DotSize))));
+                s.DotMove.X = s.Centre - dw / 2;
                 s.DotMove.Y = baseline + (DotZone - DotSize) / 2 - 1;
             }
             PlaceTip();
+        }
+
+        // Чей это столбец: место, над которым (или под которым, до самого края экрана) стоит точка x. −1 — ничей.
+        // Поля полосы слева и справа относятся к крайним местам: в угол полосы тоже можно попасть.
+        int IndexAt(double x)
+        {
+            int first = -1, last = -1;
+            for (int i = 0; i < slots.Count; i++)
+            {
+                Slot s = slots[i];
+                if (s.Kind == SlotKind.Line || s.Leaving) continue;
+                if (x >= s.CellL && x < s.CellR) return i;
+                if (first < 0) first = i;
+                last = i;
+            }
+            if (first >= 0 && x >= panelLeft && x < slots[first].CellL) return first;
+            if (last >= 0 && x >= slots[last].CellR && x <= panelRight) return last;
+            return -1;
+        }
+
+        Slot SlotAt(double x)
+        {
+            int i = IndexAt(x);
+            return i < 0 ? null : slots[i];
         }
 
         string TipFor(Slot s)
@@ -673,7 +1041,7 @@ namespace DevTxt.DockApp
             if (hover < 0 || hover >= slots.Count || slots[hover].Kind == SlotKind.Line) return;
             Slot s = slots[hover];
             double w = tip.DesiredSize.Width, h = tip.DesiredSize.Height;
-            double x = s.Left + s.W * s.Now / 2 - w / 2;
+            double x = s.Centre - w / 2;
             double top = s.Icon ? baseline - size * s.Now - TipGap - h : panelTop - WidgetTipGap - h;
             Canvas.SetLeft(tip, Math.Max(2, Math.Min(winW - w - 2, x)));
             Canvas.SetTop(tip, Math.Max(0, top));
@@ -684,7 +1052,7 @@ namespace DevTxt.DockApp
         {
             string text = hover >= 0 && hover < slots.Count ? tipOverride ?? TipFor(slots[hover]) : null;
             if (string.IsNullOrEmpty(text)) return false;
-            tipText.Text = text;
+            if (tipText.Text != text) tipText.Text = text;
             tip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
             PlaceTip();
             return true;
@@ -709,10 +1077,10 @@ namespace DevTxt.DockApp
         }
 
         // ───────── Движение ─────────
-        // Кадры идут, только пока курсор над доком или пружина ещё не успокоилась. В покое док не тратит ничего.
+        // Кадры идут, только пока курсор над доком, пружина ещё не успокоилась или что-то меняется. В покое док не тратит ничего.
         void StartLoop()
         {
-            if (looping) return;
+            if (looping || ended) return;
             looping = true;
             lastFrame = clock.ElapsedMilliseconds;
             CompositionTarget.Rendering += Frame;
@@ -739,7 +1107,7 @@ namespace DevTxt.DockApp
             catch { return false; }
         }
 
-        // Курсор над доком: над полосой или над выросшими из неё значками
+        // Курсор над доком: над полосой, над выросшими из неё значками или под ней, до самого края экрана
         bool InZone(Point p)
         {
             return p.X >= panelLeft && p.X <= panelRight && p.Y >= panelTop - amount * size * (MaxScale - 1) - 2 && p.Y <= winH + 1;
@@ -755,7 +1123,7 @@ namespace DevTxt.DockApp
             bool have = CursorHere(out p);
             if (!menuOpen)
             {
-                inside = have && !hidden && InZone(p);
+                inside = have && !hidden && !away && InZone(p);
                 if (inside) cursorU = p.X - Origin;
             }
             bool reduced = Ui.ReducedMotion;
@@ -768,16 +1136,9 @@ namespace DevTxt.DockApp
             }
             Place();
 
-            int over = -1;
-            if (inside && !menuOpen)
-                for (int i = 0; i < slots.Count; i++)
-                {
-                    Slot s = slots[i];
-                    if (s.Kind != SlotKind.Line && p.X >= s.Left - gap / 2 && p.X < s.Left + s.W * s.Now + gap / 2) { over = i; break; }
-                }
-            if (!menuOpen) SetHover(over);
+            if (!menuOpen) SetHover(inside ? IndexAt(p.X) : -1);
 
-            if (!inside && !menuOpen && Math.Abs(amount - target) < 0.0005 && Math.Abs(velocity) < 0.005)
+            if (!inside && !menuOpen && !moving && Math.Abs(amount - target) < 0.0005 && Math.Abs(velocity) < 0.005)
             {
                 amount = 0; velocity = 0;
                 Place();
@@ -785,7 +1146,7 @@ namespace DevTxt.DockApp
             }
         }
 
-        // ───────── Автоскрытие ─────────
+        // ───────── Автоскрытие и уход с экрана ─────────
         void ApplyAutoHide()
         {
             if (demo) return;
@@ -801,18 +1162,22 @@ namespace DevTxt.DockApp
             }
         }
 
-        // Десять раз в секунду, и только при включённом автоскрытии: где курсор
+        // Док стоит у самого низа экрана (панели задач Windows под ним нет)
+        bool AtScreenEdge { get { return work.Bottom >= SystemParameters.PrimaryScreenHeight - 0.5; } }
+
+        // Двадцать раз в секунду, и только при включённом автоскрытии: где курсор
         void EdgeTick()
         {
             Point p;
-            if (fullscreen || !CursorHere(out p)) return;
+            if (away || !CursorHere(out p)) return;
             long now = clock.ElapsedMilliseconds;
             if (hidden)
             {
-                // Курсор лёг на нижний край под доком и задержался там — возвращаемся. Проскочил мимо (к панели задач) — нет.
-                bool onEdge = p.X >= panelLeft && p.X <= panelRight && p.Y >= winH - 3 && p.Y <= winH + 1;
+                // Нижний край экрана во всю ширину, полоска в две точки: коснулся — док выезжает сразу. Если под доком
+                // панель задач Windows, ждём, пока курсор задержится: иначе док выскакивал бы по дороге к ней.
+                bool onEdge = p.X >= 0 && p.X <= winW && p.Y >= winH - 2 && p.Y <= winH + 1;
                 edgeHits = onEdge ? edgeHits + 1 : 0;
-                if (edgeHits >= 2) { edgeHits = 0; lastInside = now; SetHidden(false); StartLoop(); }
+                if (edgeHits >= (AtScreenEdge ? 1 : 3)) { edgeHits = 0; lastInside = now; SetHidden(false); StartLoop(); }
             }
             else if (menuOpen || InZone(p)) lastInside = now;
             else if (now - lastInside > HideAfterMs) SetHidden(true);
@@ -822,45 +1187,105 @@ namespace DevTxt.DockApp
         {
             if (hidden == hide) return;
             hidden = hide;
-            double to = hide ? HiddenY : 0;
-            if (Ui.ReducedMotion) { slide.BeginAnimation(TranslateTransform.YProperty, null); slide.Y = to; return; }
-            slide.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(to, TimeSpan.FromMilliseconds(hide ? Tokens.Motion.BaseMs : Tokens.Motion.SlowMs)) { EasingFunction = hide ? (IEasingFunction)new CubicEase { EasingMode = EasingMode.EaseIn } : Ui.EaseOut });
+            Glide();
+        }
+
+        // Дока не должно быть видно совсем: впереди игра или видео на весь экран, или выбрана панель задач Windows.
+        // Он уезжает за край и только потом окно прячется; возвращается — так же, выезжая.
+        void SyncAway()
+        {
+            bool want = fullscreen || store.Bar == "modern";
+            if (want == away) return;
+            away = want;
+            if (headless || demo) return;
+            if (!away) Show();
+            Glide();
+        }
+
+        // Полоса едет туда, где ей сейчас место: за нижний край (автоскрытие, полный экран) или обратно
+        void Glide()
+        {
+            bool down = hidden || away;
+            double to = down ? HiddenY : 0;
+            if (Ui.ReducedMotion || !IsVisible || PresentationSource.FromVisual(this) == null)
+            {
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+                slide.Y = to;
+                if (away && !headless && !demo && IsVisible) Hide();
+                return;
+            }
+            var a = new DoubleAnimation(to, TimeSpan.FromMilliseconds(down ? Tokens.Motion.BaseMs : Tokens.Motion.SlowMs)) { EasingFunction = down ? (IEasingFunction)new CubicEase { EasingMode = EasingMode.EaseIn } : Ui.EaseOut };
+            if (away) a.Completed += delegate { if (away && !ended) Hide(); };
+            slide.BeginAnimation(TranslateTransform.YProperty, a);
         }
 
         // ───────── Щелчки ─────────
-        // click — левая кнопка, middle — средняя (null — ничего)
-        void Wire(Slot slot, Action click, Action middle)
+        // Все щелчки приходят на общую полосу; чей столбец — того и щелчок. Нажатие сжимает значок сразу (70 мс),
+        // отпускание возвращает мягко (220 мс) — видно, что док услышал.
+        void StripDown(object sender, MouseButtonEventArgs e)
         {
-            FrameworkElement root = slot.Root;
-            bool pressed = false;
-            Action<bool> press = delegate(bool on) { pressed = on; root.Opacity = on ? 0.6 : 1; };
-            root.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; press(true); };
-            root.MouseLeave += delegate { press(false); };
-            root.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            Slot s = SlotAt(e.GetPosition(this).X);
+            e.Handled = true;
+            if (e.ChangedButton == MouseButton.Left)
             {
-                e.Handled = true;
-                bool was = pressed;
-                press(false);
-                if (was) click();
-            };
-            root.MouseDown += delegate(object s, MouseButtonEventArgs e)
-            {
-                if (e.ChangedButton != MouseButton.Middle || middle == null) return;
-                e.Handled = true;
-                middle();
-            };
-            root.MouseRightButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; OpenMenu(slot.Kind == SlotKind.Item ? slot : null); };
+                Release();
+                pressed = s;
+                if (s == null) return;
+                Go(s.Press, PressScale, PressDownMs);
+                Kick();
+            }
+            else if (e.ChangedButton == MouseButton.Middle && s != null) Act(s, true);
         }
 
-        // Щелчок: запущено — вывести вперёд (а если уже впереди — свернуть), нет — запустить. Средняя кнопка — ещё один экземпляр.
-        void Clicked(DockItem item, bool fresh)
+        void StripUp(object sender, MouseButtonEventArgs e)
         {
+            Slot s = SlotAt(e.GetPosition(this).X);
+            e.Handled = true;
+            if (e.ChangedButton == MouseButton.Right) { OpenMenu(s != null && s.Kind == SlotKind.Item ? s : null); return; }
+            if (e.ChangedButton != MouseButton.Left) return;
+            Slot was = pressed;
+            Release();
+            if (was != null && was == s) Act(was, false);
+        }
+
+        void Release()
+        {
+            if (pressed == null) return;
+            Go(pressed.Press, 1, PressUpMs);
+            pressed = null;
+            Kick();
+        }
+
+        // Щелчок по месту в доке. middle — средняя кнопка.
+        void Act(Slot s, bool middle)
+        {
+            if (s.Kind == SlotKind.Launcher) { if (!middle) ToggleApps(); return; }
+            if (s.Kind == SlotKind.Item) { Clicked(s, middle); return; }
+            if (s.Kind != SlotKind.Widget || demo) return;
+            // Виджеты открывают то, что на их месте открыла бы панель задач Windows
+            if (s.Widget == "volume") { if (middle) VolumeMute(); else WinKey.Chord('A'); }   // Win+A — быстрые настройки
+            else if (middle) return;
+            else if (s.Widget == "battery") WinKey.Chord('A');
+            else if (s.Widget == "clock" || s.Widget == "calendar") WinKey.Chord('N');        // Win+N — уведомления и календарь
+            else if (s.Widget == "weather") WinKey.Chord('W');                                // Win+W — виджеты Windows с погодой
+            else if (s.Widget == "music")
+            {
+                DockItem player = media != null ? Logic.Player(items, media.App) : null;
+                if (player != null && player.Running) try { Win.Activate(player.Windows[0]); } catch { }
+            }
+        }
+
+        // Щелчок по значку: не запущено — запустить; впереди чужое окно — вывести своё вперёд; своё уже впереди —
+        // единственное сворачивается, из нескольких выходит следующее. Средняя кнопка — ещё один экземпляр.
+        void Clicked(Slot slot, bool fresh)
+        {
+            DockItem item = slot.Item;
             if (demo || item == null) return;
             try
             {
                 IntPtr target = IntPtr.Zero;
                 Click what = fresh ? Click.Launch : Logic.Decide(item, Win.Foreground(), out target);
-                if (what == Click.Launch) Shell.Launch(item);
+                if (what == Click.Launch) { Shell.Launch(item); Bounce(slot); }
                 else if (what == Click.Minimize) Win.Minimize(target);
                 else Win.Activate(target);
             }
@@ -871,16 +1296,32 @@ namespace DevTxt.DockApp
             }
         }
 
+        // Программа запускается: значок мягко подпрыгивает — до трёх раз или пока не появится её окно
+        void Bounce(Slot slot)
+        {
+            if (!CanAnimate) return;
+            slot.BounceAt = clock.ElapsedMilliseconds;
+            slot.BounceStop = -1;
+            StartLoop();
+        }
+
         // Меню приложений: открыть, а если уже открыто — закрыть
         void ToggleApps()
         {
-            if (appMenu != null) { appMenu.Close(); return; }
+            if (appMenu != null) { appMenu.Shut(); return; }
             var menu = new AppMenuWindow(demo);
             appMenu = menu;
             menu.Closed += delegate { if (appMenu == menu) appMenu = null; };
             SetHover(-1);
             menu.Show();
             menu.Activate();
+        }
+
+        string TitleOf(IntPtr hwnd)
+        {
+            string t;
+            if (demo) return demoTitles.TryGetValue(hwnd, out t) ? t : "";
+            return Win.Title(hwnd);
         }
 
         PopMenu BuildMenu(Slot slot)
@@ -890,20 +1331,40 @@ namespace DevTxt.DockApp
             if (item != null)
             {
                 menu.Header(Ui.T(item.Name, Tokens.Size.Body, Ui.Label2, FontWeights.SemiBold));
+                if (item.Windows.Count > 1)
+                {
+                    // Окна программы по заголовкам: щелчок выводит окно вперёд; галочка — у того, что впереди сейчас
+                    foreach (IntPtr h in item.Windows)
+                    {
+                        IntPtr hwnd = h;
+                        string title = Logic.Shorten(TitleOf(hwnd), MenuTitleChars);
+                        menu.Item(title.Length > 0 ? title : item.Name, hwnd == fg, delegate { if (!demo) try { Win.Activate(hwnd); } catch { } });
+                    }
+                    menu.Line();
+                }
+                if (item.CanPin)
+                {
+                    menu.Item(item.Running ? "Новое окно" : "Открыть", false, delegate
+                    {
+                        if (demo) return;
+                        try { Shell.Launch(item); Bounce(slot); } catch { }
+                    });
+                    menu.Item("Показать в папке", false, delegate { if (!demo) try { Shell.Reveal(item.Path); } catch { } });
+                }
                 if (item.Pinned) menu.Item("Открепить", false, delegate { store.UnpinItem(item); SettingsChanged(); });
                 else menu.Item("Закрепить", false, item.CanPin ? new Action(delegate { store.PinItem(item); SettingsChanged(); }) : null);
-                if (item.Running) menu.Item("Закрыть окно", false, delegate { if (!demo && item.Windows.Count > 0) Win.Close(item.Windows[0]); });
+                if (item.Windows.Count == 1) menu.Item("Закрыть окно", false, delegate { if (!demo && item.Windows.Count > 0) Win.Close(item.Windows[0]); });
+                else if (item.Windows.Count > 1) menu.Item("Закрыть все окна", false, delegate { if (!demo) foreach (IntPtr h in item.Windows.ToArray()) Win.Close(h); });
                 menu.Line();
             }
             menu.Brand(DockSprite, "dock");
             menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
             menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.Bar = store.ReplaceTaskbar ? "both" : "dock"; store.Save(); SettingsChanged(); });
-            menu.Item("Компактная панель Windows вместо дока", false, delegate { store.Bar = "modern"; store.Save(); SettingsChanged(); });
             // Значки трея живут в панели задач Windows: показываем её ненадолго, сама спрячется, когда курсор уйдёт
             if (TaskbarSwap.Active) menu.Item("Значки в трее", false, delegate { TaskbarSwap.Peek(); });
             bool online = hub != null && hub.Online;
             // Настройки дока живут в core.txt: открываем его, а если его нет — предлагаем скачать
-            menu.Item(online ? "Настройки" : CoreApp.Installed ? "Настройки — открыть core.txt" : "Скачать core.txt — настройки и остальные приложения", false,
+            menu.Item(online || CoreApp.Installed ? "Настройки" : "Скачать core.txt — настройки и остальные приложения", false,
                 delegate { CoreApp.Go(online, delegate { hub.ShowCore(); }); });
             menu.Line();
             menu.Item("Выход", false, delegate { Quit(); });
@@ -913,6 +1374,7 @@ namespace DevTxt.DockApp
         void OpenMenu(Slot slot)
         {
             if (menuOpen) return;
+            Release();
             PopMenu menu = BuildMenu(slot);
             menuOpen = true;
             ShowTip();
@@ -922,7 +1384,7 @@ namespace DevTxt.DockApp
                 lastInside = clock.ElapsedMilliseconds;
                 StartLoop();   // курсор мог уйти, пока меню было открыто, — пусть значки вернутся на место
             };
-            double cx = slot != null ? slot.Left + size * slot.Now / 2 : (panelLeft + panelRight) / 2;
+            double cx = slot != null ? slot.Centre : (panelLeft + panelRight) / 2;
             Point p;
             if (slot == null && CursorHere(out p)) cx = p.X;
             double top = slot != null ? baseline - size * slot.Now : panelTop;
@@ -930,8 +1392,8 @@ namespace DevTxt.DockApp
         }
 
         // ───────── Для снимков и проверки ─────────
-        // Выдуманные значки: ни окна, ни диск, ни хаб не трогаются
-        static List<DockItem> Demo()
+        // Выдуманные значки: ни окна, ни диск, ни хаб не трогаются. У «Браузера» три окна, и одно из них впереди.
+        List<DockItem> Demo()
         {
             var list = new List<DockItem>();
             string[] pinned = { "Проводник", "Браузер", "Discord", "Steam", "Музыка", "Заметки" };
@@ -941,6 +1403,14 @@ namespace DevTxt.DockApp
                 if (i == 0 || i == 1 || i == 2 || i == 4) it.Windows.Add(new IntPtr(i + 1));
                 list.Add(it);
             }
+            string[] tabs = { "dev.txt — приложения для Windows", "Почта — входящие", "Как устроена панель задач Windows 11 и почему её хочется заменить" };
+            for (int i = 0; i < tabs.Length; i++)
+            {
+                var h = new IntPtr(i == 0 ? 2 : 50 + i);
+                if (i > 0) list[1].Windows.Add(h);
+                demoTitles[h] = tabs[i];
+            }
+            fg = new IntPtr(2);
             string[] running = { "Калькулятор", "Фотографии" };
             for (int i = 0; i < running.Length; i++)
             {
@@ -979,35 +1449,41 @@ namespace DevTxt.DockApp
             if (overWidget != null) index = slots.FindIndex(delegate(Slot s) { return s.Kind == SlotKind.Widget && s.Widget == overWidget || s.Kind == SlotKind.Launcher && overWidget == "apps"; });
             if (index >= 0)
             {
-                double a = 0;
-                for (int i = 0; i < index; i++) a += rest[i] + gap;
-                cursorU = a + (rest[index] + gap) / 2;
+                cursorU = RestCentre(index);
                 amount = store.Magnify && !Ui.ReducedMotion ? 1 : 0;
-                Place();
+                Place(true);
                 hover = index;
                 if (slots[index].Hover != null) slots[index].Hover(true);
                 FillTip();
                 tip.Opacity = withMenu ? 0 : 1;
             }
-            // Сверху — ровно столько места, сколько нужно подписи: окно выше из-за многострочных подписей виджетов
+            // Меню — то же самое, что по правому щелчку, только нарисованное в этот же снимок
+            FrameworkElement box = null;
+            if (index >= 0 && withMenu)
+            {
+                PopMenu menu = BuildMenu(slots[index].Kind == SlotKind.Item ? slots[index] : null);
+                box = (FrameworkElement)menu.Content;
+                menu.Content = null;
+                box.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            }
+            // Сверху — ровно столько места, сколько нужно подписи или меню: окно выше из-за многострочных подписей виджетов
             double above = index >= 0 && !withMenu && !slots[index].Icon ? WidgetTipGap + tip.DesiredSize.Height : size * (MaxScale - 1) + TipGap + TipH;
-            double w = winW + 40, h = EdgeGap + PadTop + size + DotZone + above + TopRoom + 36 + (withMenu ? 170 : 0);
+            double top = box != null ? size * (MaxScale - 1) + box.DesiredSize.Height - 36 + 6 + 24 : above + TopRoom + 36;
+            // Снимок — не весь экран, а док с полями
+            double full = 0;
+            foreach (Slot s in slots) full += s.W + gap;
+            double w = Math.Min(winW, full + 2 * PadH + size * 4 + 160) + 40, h = EdgeGap + PadTop + size + DotZone + top;
             var root = new Grid { Width = w, Height = h, Background = Ui.Bg, ClipToBounds = true };
             var glow = Ui.Backdrop();
             glow.RenderTransform = new TranslateTransform(0, -260);
             root.Children.Add(glow);
-            stage.HorizontalAlignment = HorizontalAlignment.Center; stage.VerticalAlignment = VerticalAlignment.Top;
-            stage.Margin = new Thickness(0, h - winH, 0, 0);
+            stage.HorizontalAlignment = HorizontalAlignment.Left; stage.VerticalAlignment = VerticalAlignment.Top;
+            stage.Margin = new Thickness((w - winW) / 2, h - winH, 0, 0);
             root.Children.Add(stage);
-            if (index >= 0 && withMenu)
+            if (box != null)
             {
-                // Меню — то же самое, что по правому щелчку, только нарисованное в этот же снимок
-                PopMenu menu = BuildMenu(slots[index].Kind == SlotKind.Item ? slots[index] : null);
-                var box = (FrameworkElement)menu.Content;
-                menu.Content = null;
-                box.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
                 box.HorizontalAlignment = HorizontalAlignment.Left; box.VerticalAlignment = VerticalAlignment.Top;
-                box.Margin = new Thickness((w - winW) / 2 + slots[index].Left + size * slots[index].Now / 2 - (box.DesiredSize.Width - 36) / 2, h - winH + baseline - size * slots[index].Now - 6 - (box.DesiredSize.Height - 36), 0, 0);
+                box.Margin = new Thickness((w - winW) / 2 + slots[index].Centre - (box.DesiredSize.Width - 36) / 2, h - winH + baseline - size * slots[index].Now - 6 - (box.DesiredSize.Height - 36), 0, 0);
                 root.Children.Add(box);
             }
             Program.Save(root, w, h, 2, file);
