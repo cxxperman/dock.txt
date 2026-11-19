@@ -14,8 +14,10 @@ namespace DevTxt.DockApp
     {
         public IntPtr Hwnd;
         public string Title, Path;
-        public string Key;     // не null — окно нельзя узнать по файлу программы (приложение из Магазина): у него свой ключ
+        public string Key;     // не null — окно нельзя узнать ни по файлу программы, ни по идентификатору: у него свой ключ
         public string Label;   // не null — готовое название вместо описания из файла
+        public string App;     // идентификатор приложения из Магазина (AppUserModelID); null — программа обычная
+        public bool Loose;     // узнано не до конца (приложение из Магазина свёрнуто) — в следующий раз смотрим заново
     }
 
     // Закреплённое приложение
@@ -25,12 +27,15 @@ namespace DevTxt.DockApp
         public string Link;   // ярлык, из которого взято: запускаем через него, чтобы не потерять его параметры
         public string Args;   // параметры ярлыка — по ним узнаём программы, которые запускаются через Update.exe
         public string Icon;   // свой значок ярлыка: "файл" или "файл,номер"
+        public string App;    // приложение из Магазина: его идентификатор (AppUserModelID). Path тогда — «shell:AppsFolder\идентификатор»
     }
 
     // Один значок в доке
     class DockItem
     {
         public string Key, Name, Path, Link, Icon;
+        public string App;    // приложение из Магазина: запускается и получает значок по идентификатору, а не по файлу
+        public string Exe;    // файл, из которого оно сейчас работает (по нему находят счётчики непрочитанного); null — не знаем
         public bool Pinned, CanPin = true;
         public Pin Pin;
         public readonly List<IntPtr> Windows = new List<IntPtr>();   // сверху вниз: первое — то, с которым работали последним
@@ -41,7 +46,52 @@ namespace DevTxt.DockApp
 
     static class Logic
     {
+        public const string AppsFolder = "shell:AppsFolder\\";   // папка приложений Windows: в ней приложения из Магазина
+        public const double DragSlop = 6, DragOutHeights = 1.5;
+
         static string Lower(string s) { return (s ?? "").ToLowerInvariant(); }
+        static bool Same(string a, string b) { return a != null && b != null && string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+
+        // По чему значок узнаётся между перерисовками: приложение из Магазина — по идентификатору, обычное — по файлу
+        static string KeyOf(string app, string path) { return string.IsNullOrEmpty(app) ? Lower(path) : "app|" + Lower(app); }
+
+        // Этот значок — то же самое приложение, что и закреплённое?
+        public static bool SamePin(Pin pin, DockItem item)
+        {
+            if (pin == null || item == null) return false;
+            if (!string.IsNullOrEmpty(item.App) || !string.IsNullOrEmpty(pin.App)) return Same(pin.App, item.App);
+            return Same(pin.Path, item.Path);
+        }
+
+        // ───────── Перетаскивание значков ─────────
+        // Переставляет элемент списка с места from на место to. false — переставлять нечего.
+        public static bool Move<T>(List<T> list, int from, int to)
+        {
+            if (list == null || from < 0 || from >= list.Count) return false;
+            to = Math.Max(0, Math.Min(list.Count - 1, to));
+            if (to == from) return false;
+            T item = list[from];
+            list.RemoveAt(from);
+            list.Insert(to, item);
+            return true;
+        }
+
+        // Кнопку нажали и повели: это уже перетаскивание, а не щелчок?
+        public static bool DragStarts(double dx, double dy) { return dx * dx + dy * dy > DragSlop * DragSlop; }
+
+        // Значок унесли высоко над доком (above — на сколько курсор выше полосы): отпустить здесь — открепить
+        public static bool DragOut(double above, double size) { return above > DragOutHeights * size; }
+
+        // На какое место встанет значок, если отпустить его в точке x. left[i]..right[i] — места закреплённых значков по порядку,
+        // current — где он сейчас. У границы мест значок не мечется: чтобы сменить место, её надо перейти на slack.
+        public static int DropIndex(double[] left, double[] right, double x, int current, double slack)
+        {
+            int n = left == null || right == null ? 0 : Math.Min(left.Length, right.Length);
+            if (n == 0) return -1;
+            if (current >= 0 && current < n && x >= left[current] - slack && x < right[current] + slack) return current;
+            for (int i = 0; i < n; i++) if (x < right[i]) return i;
+            return n - 1;
+        }
 
         // Программа, которую на самом деле запускает ярлык вида «Update.exe --processStart Discord.exe»; null — ярлык обычный
         public static string StartedExe(Pin pin)
@@ -89,7 +139,7 @@ namespace DevTxt.DockApp
         public static string ExeOf(DockItem item)
         {
             if (item == null) return "";
-            return Lower(StartedExe(item.Pin) ?? FileOf(item.Path));
+            return Lower(StartedExe(item.Pin) ?? FileOf(item.Exe ?? item.Path));
         }
 
         // ───────── Названия ─────────
@@ -133,6 +183,7 @@ namespace DevTxt.DockApp
         public static string PinName(Pin pin, Func<string, string> nameOf)
         {
             if (!LooksLikeHelper(pin.Name)) return pin.Name;
+            if (pin.App != null && !string.IsNullOrEmpty(pin.Name)) return pin.Name;   // у приложения из Магазина файла с описанием нет
             if (!string.IsNullOrEmpty(pin.Link))
             {
                 string link = FileOf(pin.Link);
@@ -145,37 +196,40 @@ namespace DevTxt.DockApp
         }
 
         // Значки дока: сначала закреплённые в своём порядке, за ними — запущенные, которых среди закреплённых нет.
-        // Окна собираются по файлу программы. nameOf — как назвать программу по её файлу.
+        // Окна собираются по файлу программы, а у приложений из Магазина — по идентификатору: файл у них меняется
+        // с каждым обновлением. nameOf — как назвать программу по её файлу.
         public static List<DockItem> Group(List<Pin> pins, List<WinInfo> wins, bool showRunning, Func<string, string> nameOf)
         {
             var items = new List<DockItem>();
             var seen = new Dictionary<string, bool>();
             foreach (var p in pins)
             {
-                string key = Lower(p.Path);
+                string key = KeyOf(p.App, p.Path);
                 if (key.Length == 0 || seen.ContainsKey(key)) continue;
                 seen[key] = true;
-                items.Add(new DockItem { Key = key, Name = PinName(p, nameOf), Path = p.Path, Link = p.Link, Icon = p.Icon, Pinned = true, Pin = p });
+                items.Add(new DockItem { Key = key, Name = PinName(p, nameOf), Path = p.Path, Link = p.Link, Icon = p.Icon, App = p.App, Pinned = true, Pin = p });
             }
             var running = new Dictionary<string, DockItem>();
             foreach (var w in wins)
             {
                 if (string.IsNullOrEmpty(w.Path)) continue;
                 DockItem found = null;
-                if (w.Key == null) found = items.Find(delegate(DockItem i) { return i.Pinned && PinMatches(i.Pin, w.Path); });
+                if (w.App != null) found = items.Find(delegate(DockItem i) { return i.Pinned && Same(i.App, w.App); });
+                if (found == null && w.Key == null) found = items.Find(delegate(DockItem i) { return i.Pinned && PinMatches(i.Pin, w.Path); });
                 if (found == null)
                 {
-                    string key = w.Key ?? Lower(w.Path);
+                    string key = w.Key ?? KeyOf(w.App, w.Path);
                     if (!running.TryGetValue(key, out found))
                     {
                         if (!showRunning) continue;
                         string name = w.Label ?? (nameOf != null ? nameOf(w.Path) : null);
                         if (string.IsNullOrEmpty(name)) name = System.IO.Path.GetFileNameWithoutExtension(w.Path);
-                        found = new DockItem { Key = key, Name = name, Path = w.Path, CanPin = w.Key == null };
+                        found = new DockItem { Key = key, Name = name, Path = w.Path, App = w.Key == null ? w.App : null, CanPin = w.Key == null };
                         running[key] = found;
                         items.Add(found);
                     }
                 }
+                if (found.App != null && found.Exe == null && !w.Loose) found.Exe = w.Path;
                 found.Windows.Add(w.Hwnd);
             }
             return items;
@@ -395,9 +449,13 @@ namespace DevTxt.DockApp
                     foreach (object o in (object[])list)
                     {
                         var p = o as Dictionary<string, object>;
-                        string path = Str(p, "path");
+                        // Старые файлы знают только программы по файлу; у приложения из Магазина есть ещё «app» — его идентификатор
+                        string path = Str(p, "path"), app = Str(p, "app");
+                        if (string.IsNullOrEmpty(app)) app = null;
+                        if (app == null && path != null && path.StartsWith(Logic.AppsFolder, StringComparison.OrdinalIgnoreCase) && path.Length > Logic.AppsFolder.Length) app = path.Substring(Logic.AppsFolder.Length);
+                        if (string.IsNullOrEmpty(path) && app != null) path = Logic.AppsFolder + app;
                         if (string.IsNullOrEmpty(path)) continue;
-                        Pins.Add(new Pin { Name = Str(p, "name") ?? System.IO.Path.GetFileNameWithoutExtension(path), Path = path, Link = Str(p, "link"), Args = Str(p, "args"), Icon = Str(p, "icon") });
+                        Pins.Add(new Pin { Name = Str(p, "name") ?? (app != null ? app : System.IO.Path.GetFileNameWithoutExtension(path)), Path = path, Link = Str(p, "link"), Args = Str(p, "args"), Icon = Str(p, "icon"), App = app });
                     }
                 object set;
                 d.TryGetValue("settings", out set);
@@ -428,6 +486,7 @@ namespace DevTxt.DockApp
                     if (p.Link != null) one["link"] = p.Link;
                     if (p.Args != null) one["args"] = p.Args;
                     if (p.Icon != null) one["icon"] = p.Icon;
+                    if (p.App != null) one["app"] = p.App;
                     pins.Add(one);
                 }
                 var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "bar", Bar, "winKey", WinKey);
@@ -445,16 +504,26 @@ namespace DevTxt.DockApp
 
         public void PinItem(DockItem item)
         {
-            if (!item.CanPin || Pins.Exists(delegate(Pin p) { return string.Equals(p.Path, item.Path, StringComparison.OrdinalIgnoreCase); })) return;
-            Pins.Add(new Pin { Name = item.Name, Path = item.Path });
+            if (!item.CanPin || Pins.Exists(delegate(Pin p) { return Logic.SamePin(p, item); })) return;
+            // Приложение из Магазина закрепляется по идентификатору: по нему оно запустится и получит значок и после обновления
+            if (item.App != null) Pins.Add(new Pin { Name = item.Name, Path = Logic.AppsFolder + item.App, App = item.App });
+            else Pins.Add(new Pin { Name = item.Name, Path = item.Path });
             Save();
         }
 
         public void UnpinItem(DockItem item)
         {
-            string path = item.Pin != null ? item.Pin.Path : item.Path;
-            Pins.RemoveAll(delegate(Pin p) { return string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase); });
+            var what = item.Pin != null ? new DockItem { Path = item.Pin.Path, App = item.Pin.App } : item;
+            Pins.RemoveAll(delegate(Pin p) { return Logic.SamePin(p, what); });
             Save();
+        }
+
+        // Закреплённое переставили: с места from на место to (номера в Pins). false — порядок не изменился.
+        public bool Move(int from, int to)
+        {
+            if (!Logic.Move(Pins, from, to)) return false;
+            Save();
+            return true;
         }
 
         static int Clamp(double v) { return (int)Math.Max(MinSize, Math.Min(MaxSize, Math.Round(v))); }

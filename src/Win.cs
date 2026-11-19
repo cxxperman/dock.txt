@@ -70,6 +70,14 @@ namespace DevTxt.DockApp
 
         public static IntPtr Foreground() { return GetForegroundWindow(); }
 
+        public static bool Minimized(IntPtr hwnd) { try { return IsIconic(hwnd); } catch { return false; } }
+
+        // Клавиша сейчас нажата? Только вопрос к Windows: ввод не перехватывается. Док не берёт фокус,
+        // поэтому Esc во время перетаскивания значка до него иначе не дошёл бы.
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        public const int KeyEscape = 0x1B;
+        public static bool KeyDown(int key) { try { return (GetAsyncKeyState(key) & 0x8000) != 0; } catch { return false; } }
+
         // Заголовок окна — для списка окон в меню значка
         public static string Title(IntPtr hwnd)
         {
@@ -155,26 +163,42 @@ namespace DevTxt.DockApp
                     if (pid == self) return true;
                     WinInfo w;
                     bool host = false;
-                    if (!known.TryGetValue(hwnd, out w) || w.Path == null || w.Key != null)
+                    if (!known.TryGetValue(hwnd, out w) || w.Path == null || w.Key != null || w.Loose)
                     {
                         w = new WinInfo { Hwnd = hwnd, Path = PathOf(pid) };
                         host = Class(hwnd) == "ApplicationFrameWindow";
+                        if (!host) w.App = Packaged.OfProcess(pid);   // упакованная программа со своим окном (Терминал, новый Блокнот)
                     }
                     w.Title = Text(hwnd);
                     if (host)
                     {
                         // Приложение из Магазина: окно держит общая программа-рамка, а само приложение — в дочернем окне
                         string inner = null;
+                        uint innerPid = 0;
                         EnumChildWindows(hwnd, delegate(IntPtr child, IntPtr l2)
                         {
                             uint cp;
                             GetWindowThreadProcessId(child, out cp);
                             if (cp == pid) return true;
                             inner = PathOf(cp);
+                            innerPid = cp;
                             return inner == null;
                         }, IntPtr.Zero);
-                        if (inner != null) w.Path = inner;
-                        else { w.Key = "frame|" + w.Title.ToLowerInvariant(); w.Label = w.Title; }   // свёрнуто: приложения внутри нет, узнаём по заголовку
+                        if (inner != null) { w.Path = inner; w.App = Packaged.OfProcess(innerPid) ?? Packaged.OfWindow(hwnd); }
+                        else
+                        {
+                            // Свёрнуто: приложения внутри нет. Окно само знает, чьё оно; не знает — узнаём по заголовку.
+                            w.App = Packaged.OfWindow(hwnd);
+                            w.Loose = true;
+                            w.Label = w.Title;
+                            if (w.App == null) w.Key = "frame|" + w.Title.ToLowerInvariant();
+                        }
+                    }
+                    if (w.App != null)
+                    {
+                        // Название — то же, что в «Пуске», как только список приложений собран
+                        string app = Packaged.Name(w.App);
+                        if (app != null) w.Label = app;
                     }
                     if (w.Path == null) return true;
                     next[hwnd] = w;
@@ -351,9 +375,17 @@ namespace DevTxt.DockApp
             return pins;
         }
 
-        // Запускает приложение: через ярлык, если он есть и цел (в нём параметры и рабочая папка), иначе сам файл
+        // Значок для дока: свой значок ярлыка, значок приложения из Магазина или значок из файла программы
+        public static ImageSource IconOf(DockItem item)
+        {
+            return Icon(item.Icon) ?? (item.App != null ? Packaged.Icon(item.App) : null) ?? Icon(item.Exe ?? item.Path);
+        }
+
+        // Запускает приложение: через ярлык, если он есть и цел (в нём параметры и рабочая папка), иначе сам файл.
+        // Приложение из Магазина — по идентификатору.
         public static void Launch(DockItem item)
         {
+            if (item.App != null) { Packaged.Open(item.App); return; }
             string what = item.Link != null && File.Exists(item.Link) ? item.Link : item.Path;
             var info = new ProcessStartInfo(what) { UseShellExecute = true };
             if (what == item.Path)

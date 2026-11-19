@@ -4,6 +4,8 @@
 //   --nohub             вместе с --demo: без выдуманных данных из хаба — только часы, громкость и батарея
 //   --shot файл.png     нарисовать док в файл и выйти (обычно вместе с --demo); --hover N — будто курсор над значком N,
 //                       --hover music|calendar|weather|volume|battery|clock|apps — над виджетом или кнопкой меню; --menu — с меню этого значка
+//                       --previews — вместе с --demo и --hover N: над значком панель с его окнами (окна нарисованные);
+//                       --drag N — вместе с --demo: закреплённый значок N будто бы несут на два места правее; --out — унесли из дока
 //   --apps              вместе с --shot: нарисовать меню приложений; --query текст — с этим текстом в поиске
 //   --selftest          проверить сборку значков из окон, закрепление, увеличение, настройки, виджеты, счётчики, названия и поиск в меню; код выхода 0 — всё в порядке
 //   --probe [файл]      запуститься по-настоящему, провести по доку выдуманный курсор, записать, что док увидел, и выйти
@@ -81,7 +83,14 @@ namespace DevTxt.DockApp
                 app.SessionEnding += delegate { WinKey.Stop(); TaskbarSwap.Give(store.Dir); };
             }
             var w = new DockWindow(demo, store, headless, Array.IndexOf(args, "--nohub") < 0);
-            if (shot != null) { w.Shot(shot, hover, overWidget, Array.IndexOf(args, "--menu") >= 0); return 0; }
+            if (shot != null)
+            {
+                // Панель с окнами и перетаскивание рисуются только выдуманными: настоящие окна и закреплённое не трогаются
+                int dragged = -1;
+                if (!demo || Arg(args, "--drag") == null || !int.TryParse(Arg(args, "--drag"), out dragged)) dragged = -1;
+                w.Shot(shot, hover, overWidget, Array.IndexOf(args, "--menu") >= 0, demo && Array.IndexOf(args, "--previews") >= 0, dragged, Array.IndexOf(args, "--out") >= 0);
+                return 0;
+            }
 
             w.Closed += delegate { app.Shutdown(); };
             if (!headless) w.Show();
@@ -244,6 +253,69 @@ namespace DevTxt.DockApp
                 none.PinItem(items[3]);
                 none.Save();
                 Check(none.Pins.Count == 1 && !none.Load(), "demo store keeps pins in memory and touches no disk");
+
+                // ── Перетаскивание: порядок закреплённого ──
+                var order = new List<string> { "a", "b", "c", "d" };
+                Check(Logic.Move(order, 0, 2) && string.Join("", order.ToArray()) == "bcad", "moving right puts the item at the new place, got " + string.Join("", order.ToArray()));
+                Check(Logic.Move(order, 3, 0) && string.Join("", order.ToArray()) == "dbca", "moving left too");
+                Check(!Logic.Move(order, 1, 1) && !Logic.Move(order, 9, 0) && !Logic.Move(order, -1, 0) && !Logic.Move<string>(null, 0, 1) && string.Join("", order.ToArray()) == "dbca", "moving nowhere or from nowhere changes nothing");
+                Check(Logic.Move(order, 0, 99) && string.Join("", order.ToArray()) == "bcad", "a place past the end is the last place");
+                Check(!Logic.DragStarts(0, 0) && !Logic.DragStarts(4, 4) && !Logic.DragStarts(6, 0) && Logic.DragStarts(7, 0) && Logic.DragStarts(-5, 5), "a press becomes a drag only after about six points of movement");
+                Check(!Logic.DragOut(72, 48) && Logic.DragOut(73, 48) && !Logic.DragOut(-20, 48), "an icon is dragged out when the cursor is more than 1.5 icon heights above the dock");
+                double[] cellL = { 0, 56, 112, 168 }, cellR = { 56, 112, 168, 224 };
+                Check(Logic.DropIndex(cellL, cellR, 30, 0, 6) == 0 && Logic.DropIndex(cellL, cellR, 130, 0, 6) == 2 && Logic.DropIndex(cellL, cellR, -50, 2, 6) == 0 && Logic.DropIndex(cellL, cellR, 999, 0, 6) == 3, "the drop place is the cell under the icon, clamped to the pinned ones");
+                Check(Logic.DropIndex(cellL, cellR, 115, 1, 6) == 1 && Logic.DropIndex(cellL, cellR, 119, 1, 6) == 2 && Logic.DropIndex(cellL, cellR, 52, 1, 6) == 1 && Logic.DropIndex(cellL, cellR, 49, 1, 6) == 0, "at a cell border the icon keeps its place until the border is clearly crossed");
+                Check(Logic.DropIndex(new double[0], new double[0], 5, 0, 6) == -1 && Logic.DropIndex(null, null, 5, 0, 6) == -1, "nothing pinned — nowhere to drop");
+                var mv = new Store(dir);
+                mv.Pins.Add(new Pin { Name = "A", Path = @"C:\a\a.exe" });
+                mv.Pins.Add(new Pin { Name = "B", Path = @"C:\b\b.exe" });
+                mv.Pins.Add(new Pin { Name = "C", Path = @"C:\c\c.exe" });
+                Check(mv.Move(2, 0) && !mv.Move(1, 1) && !mv.Move(7, 0), "the store moves a pin and refuses a move that changes nothing");
+                var mv2 = new Store(dir);
+                mv2.Load();
+                Check(mv2.Pins.Count == 3 && mv2.Pins[0].Name == "C" && mv2.Pins[1].Name == "A" && mv2.Pins[2].Name == "B", "the new order of pins survives a restart");
+                Check(mv2.AutoHide == mv.AutoHide && mv2.Size == mv.Size, "moving a pin keeps the settings");
+
+                // ── Приложения из Магазина: закрепление по идентификатору ──
+                const string calc = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+                var storeWins = new List<WinInfo>
+                {
+                    new WinInfo { Hwnd = new IntPtr(21), Title = "Калькулятор", Path = @"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator_11.2405.2.0_x64__8wekyb3d8bbwe\CalculatorApp.exe", App = calc, Label = "Калькулятор" },
+                    new WinInfo { Hwnd = new IntPtr(22), Title = "Калькулятор", Path = @"C:\Windows\System32\ApplicationFrameHost.exe", App = calc.ToUpperInvariant(), Label = "Калькулятор", Loose = true },
+                    new WinInfo { Hwnd = new IntPtr(23), Title = "Unknown", Path = @"C:\Windows\System32\ApplicationFrameHost.exe", Key = "frame|unknown", Label = "Unknown", Loose = true },
+                    W(24, @"C:\Tools\term.exe")
+                };
+                var storeItems = Logic.Group(new List<Pin>(), storeWins, true, nameOf);
+                Check(storeItems.Count == 3 && storeItems[0].App == calc && storeItems[0].Windows.Count == 2 && storeItems[0].Name == "Калькулятор" && storeItems[0].CanPin, "windows of a Store app are grouped by its id — a minimised frame included — and it can be pinned");
+                Check(storeItems.Count == 3 && storeItems[0].Exe != null && storeItems[0].Exe.EndsWith("CalculatorApp.exe") && Logic.ExeOf(storeItems[0]) == "calculatorapp.exe", "a Store app is known to the unread counters by its real file");
+                Check(storeItems.Count == 3 && !storeItems[1].CanPin && storeItems[1].App == null && storeItems[2].App == null && storeItems[2].CanPin, "a frame that names no app still cannot be pinned; ordinary programs are untouched");
+                var sp = new Store(dir);
+                sp.Load();
+                sp.PinItem(storeItems[0]);
+                sp.PinItem(storeItems[0]);
+                var sp2 = new Store(dir);
+                sp2.Load();
+                Pin calcPin = sp2.Pins.Find(delegate(Pin p) { return p.App != null; });
+                Check(sp2.Pins.Count == 4 && calcPin != null && calcPin.App == calc && calcPin.Path == Logic.AppsFolder + calc && calcPin.Name == "Калькулятор", "a pinned Store app keeps its id and name after a restart, and is pinned once");
+                var afterUpdate = new List<WinInfo> { new WinInfo { Hwnd = new IntPtr(31), Title = "Калькулятор", Path = @"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator_12.0.0.0_x64__8wekyb3d8bbwe\CalculatorApp.exe", App = calc } };
+                var pinnedStore = Logic.Group(sp2.Pins, afterUpdate, true, nameOf);
+                DockItem calcItem = pinnedStore.Find(delegate(DockItem i) { return i.App == calc; });
+                Check(pinnedStore.Count == 4 && calcItem != null && calcItem.Pinned && calcItem.Running && calcItem.Key == storeItems[0].Key && calcItem.Name == "Калькулятор", "the pin finds its window after the app was updated (another folder), and keeps the same place in the dock");
+                var idle = Logic.Group(sp2.Pins, new List<WinInfo>(), true, nameOf).Find(delegate(DockItem i) { return i.App == calc; });
+                Check(idle != null && !idle.Running && idle.Path == Logic.AppsFolder + calc, "a pinned Store app that is not running is launched by its id");
+                sp2.UnpinItem(calcItem);
+                var sp3 = new Store(dir);
+                sp3.Load();
+                Check(sp3.Pins.Count == 3 && !sp3.Pins.Exists(delegate(Pin p) { return p.App != null; }), "unpinning a Store app removes exactly it");
+                // Файл прежней версии: о приложениях из Магазина он не знает
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[{\"name\":\"Notes\",\"path\":\"C:\\\\Apps\\\\Notes\\\\notes.exe\"},{\"name\":\"Чат\",\"path\":\"C:\\\\Chat\\\\Update.exe\",\"link\":\"C:\\\\l\\\\Chat.lnk\",\"args\":\"--processStart Chat.exe\",\"icon\":\"C:\\\\Chat\\\\app.ico,0\"}],\"settings\":{\"autoHide\":true,\"size\":40,\"bar\":\"both\"}}");
+                var legacy = new Store(dir);
+                Check(legacy.Load() && legacy.Pins.Count == 2 && legacy.Pins[0].Path == @"C:\Apps\Notes\notes.exe" && legacy.Pins[0].App == null && legacy.Pins[1].Link == @"C:\l\Chat.lnk" && legacy.Pins[1].Args == "--processStart Chat.exe" && legacy.Pins[1].App == null && legacy.AutoHide && legacy.Size == 40, "a state file written before Store apps reads as before");
+                legacy.Save();
+                Check(!File.ReadAllText(Path.Combine(dir, "state.json")).Contains("\"app\""), "…and ordinary pins are written back without the new field");
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[{\"name\":\"Calc\",\"app\":\"" + calc + "\"},{\"name\":\"Term\",\"path\":\"shell:AppsFolder\\\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App\"},{\"name\":\"Empty\"}]}");
+                var loose = new Store(dir);
+                Check(loose.Load() && loose.Pins.Count == 2 && loose.Pins[0].Path == Logic.AppsFolder + calc && loose.Pins[1].App == "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", "a Store pin is understood from its id alone or from its path alone; a pin with neither is dropped");
             }
             finally { try { Directory.Delete(dir, true); } catch { } }
 
@@ -511,6 +583,40 @@ namespace DevTxt.DockApp
             Check(search("БЛО") == "Блокнот|" && search("елка") == "Ёлка|" && search("ёлка") == "Ёлка|" && search("веб") == "Карты (веб)|Почта (веб)|", "Russian: case and ё/е do not matter; a word in brackets counts as a word");
             Check(search("c") == "Chrome|Visual Studio Code|" && search("h") == "Helper Tool|Chrome|", "names and words that start with the query come before plain matches");
             Check(search("zzz") == "" && AppRules.Filter(null, "a").Count == 0, "nothing found is an empty list");
+            // Приложения из Магазина в меню
+            Check(AppRules.IsPackaged("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App") && AppRules.IsPackaged("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel") && AppRules.IsPackaged("Claude_pzs8sxrjxfjjc!Claude"), "a packaged app is known by its id: family_publisher!app");
+            Check(!AppRules.IsPackaged(@"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\notepad.exe") && !AppRules.IsPackaged("Microsoft.AutoGenerated.{923DD477-5846-686B-A659-0FCCD73851A8}") && !AppRules.IsPackaged("MSEdge") && !AppRules.IsPackaged(@"C:\Apps\Odd!Name_1\app.exe") && !AppRules.IsPackaged("NoFamily!App") && !AppRules.IsPackaged("Family_pub!") && !AppRules.IsPackaged(null) && !AppRules.IsPackaged(""), "ordinary programs in the apps folder are not packaged apps");
+            var packaged = new List<AppEntry>
+            {
+                new AppEntry { Name = "Параметры", App = "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" },
+                new AppEntry { Name = "chrome", App = "Google.Chrome_8wekyb3d8bbwe!App" },
+                new AppEntry { Name = "Readme", App = "Some.App_abc!App" },
+                new AppEntry { Name = "Not packaged", App = "MSEdge" },
+                new AppEntry { Name = "Калькулятор", App = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" },
+                new AppEntry { Name = "Калькулятор", App = "Other.Calc_abc!App" },
+                null
+            };
+            var merged = AppRules.Merge(clean, packaged);
+            Check(merged.Count == clean.Count + 2 && merged.Exists(delegate(AppEntry e) { return e.Name == "Параметры" && e.App != null; }) && merged.FindAll(delegate(AppEntry e) { return e.Name == "Калькулятор"; }).Count == 1, "Store apps join the menu once each; junk and ordinary programs do not, got " + merged.Count + " from " + clean.Count);
+            Check(merged.FindAll(delegate(AppEntry e) { return AppRules.Lower(e.Name) == "chrome"; }).Count == 1 && merged.Find(delegate(AppEntry e) { return AppRules.Lower(e.Name) == "chrome"; }).App == null, "an app that already has a shortcut under the same name is not listed twice — the shortcut wins");
+            bool sorted = true;
+            for (int i = 1; i < merged.Count; i++) if (string.Compare(merged[i - 1].Name, merged[i].Name, StringComparison.CurrentCultureIgnoreCase) > 0) sorted = false;
+            Check(sorted && AppRules.Merge(null, null).Count == 0 && AppRules.Merge(clean, null).Count == clean.Count, "the merged list stays in alphabetical order; nothing to add is fine");
+            int[] trim = AppRules.Trim(96, 96, 28, 28, 67, 67), whole = AppRules.Trim(96, 96, 6, 8, 90, 88), edge = AppRules.Trim(96, 96, 0, 0, 39, 20);
+            Check(trim[2] == trim[3] && trim[2] >= 40 && trim[2] < 60 && trim[0] <= 28 && trim[0] + trim[2] >= 68 && trim[1] <= 28 && trim[1] + trim[3] >= 68, "an icon with wide empty margins is cropped to a square around the drawing");
+            Check(whole[0] == 0 && whole[1] == 0 && whole[2] == 96 && whole[3] == 96, "an icon that fills its picture is left whole");
+            Check(edge[0] == 0 && edge[1] == 0 && edge[2] == edge[3] && edge[0] + edge[2] <= 96 && AppRules.Trim(0, 0, 0, 0, 0, 0)[2] == 0 && AppRules.Trim(96, 96, 50, 50, 10, 10)[2] == 96, "the crop never leaves the picture; an empty picture is left alone");
+
+            // ── Панель с окнами программы ──
+            Size wide = PreviewRules.Thumb(16 / 9.0), tall = PreviewRules.Thumb(0.5), unknown = PreviewRules.Thumb(0), strip = PreviewRules.Thumb(8);
+            Check(wide.Width == 200 && Math.Abs(wide.Height - 112.5) <= 0.5 && tall.Height == PreviewRules.ThumbMaxH && tall.Width == PreviewRules.ThumbMinW && unknown.Width == 200 && Near(unknown.Height, 125) && strip.Height == PreviewRules.ThumbMinH, "a window preview is about 200 wide in the window's proportions; tall and very wide windows stay within limits");
+            Rect fitWide = PreviewRules.Fit(2, 200, 132), fitTall = PreviewRules.Fit(0.5, 104, 132);
+            Check(Near(fitWide.Width, 200) && Near(fitWide.Height, 100) && Near(fitWide.Y, 16) && Near(fitWide.X, 0) && Near(fitTall.Height, 132) && Near(fitTall.Width, 66) && Near(fitTall.X, 19), "the picture keeps the window's proportions and sits in the middle of its place");
+            var cardsA = new List<PreviewCard> { new PreviewCard { Hwnd = new IntPtr(1), Title = "a" }, new PreviewCard { Hwnd = new IntPtr(2), Title = "b" } };
+            var cardsB = new List<PreviewCard> { new PreviewCard { Hwnd = new IntPtr(1), Title = "other title" }, new PreviewCard { Hwnd = new IntPtr(2), Title = "b" } };
+            var cardsC = new List<PreviewCard> { new PreviewCard { Hwnd = new IntPtr(1), Title = "a" }, new PreviewCard { Hwnd = new IntPtr(2), Title = "b", Minimized = true } };
+            Check(PreviewRules.SameWindows(cardsA, cardsB) && !PreviewRules.SameWindows(cardsA, cardsC) && !PreviewRules.SameWindows(cardsA, new List<PreviewCard>()) && !PreviewRules.SameWindows(null, cardsA), "a new title does not rebuild the previews; a closed or minimised window does");
+            Check(PreviewRules.MaxWindows == 5 && PreviewRules.OpenMs >= 300 && PreviewRules.OpenMs <= 500 && PreviewRules.CloseMs >= 150 && PreviewRules.CloseMs <= 250, "up to five windows; opens after a rest of about 0.4 s and closes about 0.2 s after the cursor left");
             Check(AppRules.Rank("Visual Studio Code", "vis") == 0 && AppRules.Rank("Visual Studio Code", "code") == 1 && AppRules.Rank("Visual Studio Code", "isual") == 2 && AppRules.Rank("Visual Studio Code", "xx") == -1, "ranking: start of name, start of a word, anywhere, nowhere");
             Check(AppRules.Move(0, 10, 4, 1, 0) == 1 && AppRules.Move(0, 10, 4, -1, 0) == 0 && AppRules.Move(1, 10, 4, 0, 1) == 5 && AppRules.Move(5, 10, 4, 0, -1) == 1 && AppRules.Move(1, 10, 4, 0, -1) == 1, "arrows move the selection and stop at the edges");
             Check(AppRules.Move(6, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 1, 0) == 9 && AppRules.Move(-1, 10, 4, 0, 1) == 0 && AppRules.Move(0, 0, 4, 1, 0) == -1, "down from above a short last row lands on the last app");

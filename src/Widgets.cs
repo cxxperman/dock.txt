@@ -258,10 +258,11 @@ namespace DevTxt.DockApp
         }
     }
 
-    // Приложение в меню: ярлык из меню «Пуск»
+    // Приложение в меню: ярлык из меню «Пуск» или приложение из Магазина (у него нет ярлыка, зато есть идентификатор App)
     class AppEntry
     {
         public string Name, Target, Args, Link, Icon;
+        public string App;
         public System.Windows.Media.ImageSource Image;
     }
 
@@ -316,6 +317,52 @@ namespace DevTxt.DockApp
             }
             list.Sort(delegate(AppEntry a, AppEntry b) { return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase); });
             return list;
+        }
+
+        // Идентификатор упакованного приложения: «Семейство_издатель!Приложение». У обычных программ в папке приложений
+        // Windows вместо него путь к файлу или случайный набор — такие уже есть среди ярлыков.
+        public static bool IsPackaged(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return false;
+            int bang = id.IndexOf('!');
+            if (bang < 3 || bang == id.Length - 1 || id.IndexOf('!', bang + 1) >= 0) return false;
+            if (id.IndexOf('\\') >= 0 || id.IndexOf('/') >= 0 || id.IndexOf(':') >= 0) return false;
+            int under = id.LastIndexOf('_', bang);
+            return under > 0 && under < bang - 1;
+        }
+
+        // К ярлыкам добавляются приложения из Магазина. То, что уже есть под тем же названием, второй раз не появляется:
+        // ярлык главнее (в нём параметры запуска). Обвязка убирается, порядок — по алфавиту.
+        public static List<AppEntry> Merge(List<AppEntry> links, List<AppEntry> packaged)
+        {
+            var list = new List<AppEntry>(links ?? new List<AppEntry>());
+            var seen = new Dictionary<string, bool>();
+            foreach (var e in list) seen[Lower(e.Name).Trim()] = true;
+            if (packaged != null)
+                foreach (var e in packaged)
+                {
+                    if (e == null || string.IsNullOrEmpty(e.Name) || !IsPackaged(e.App) || IsJunk(e.Name, "")) continue;
+                    string key = Lower(e.Name).Trim();
+                    if (seen.ContainsKey(key)) continue;
+                    seen[key] = true;
+                    list.Add(e);
+                }
+            list.Sort(delegate(AppEntry a, AppEntry b) { return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase); });
+            return list;
+        }
+
+        // До какого квадрата обрезать значок с широкими прозрачными полями: {x, y, ширина, высота}.
+        // left..bottom — где на картинке w×h что-то нарисовано. Поля небольшие — картинка остаётся целой.
+        public static int[] Trim(int w, int h, int left, int top, int right, int bottom)
+        {
+            var whole = new int[] { 0, 0, w, h };
+            if (w <= 0 || h <= 0 || right < left || bottom < top) return whole;
+            int side = Math.Max(right - left + 1, bottom - top + 1);
+            side += 2 * (int)Math.Ceiling(side * 0.04);   // немного воздуха вокруг
+            if (side >= Math.Min(w, h) * 0.86) return whole;
+            int x = Math.Max(0, Math.Min(w - side, (left + right + 1) / 2 - side / 2));
+            int y = Math.Max(0, Math.Min(h - side, (top + bottom + 1) / 2 - side / 2));
+            return new int[] { x, y, side, side };
         }
 
         // Насколько название подходит к запросу: 0 — начинается с него, 1 — каждое слово запроса начинает какое-то слово названия,

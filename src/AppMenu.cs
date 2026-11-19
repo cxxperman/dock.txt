@@ -1,5 +1,5 @@
 // dock.txt. AppMenu.cs — меню приложений вместо «Пуска»: затемнённый экран, строка поиска и сетка всех программ
-// из папок меню «Пуск». Список и значки собираются в фоновом потоке и остаются в памяти, поэтому меню
+// из папок меню «Пуск» и приложения из Магазина. Список и значки собираются в фоновом потоке и остаются в памяти, поэтому меню
 // открывается сразу. Какие ярлыки считать приложениями и как искать — в Widgets.cs (AppRules).
 using System;
 using System.Collections.Generic;
@@ -16,7 +16,8 @@ using System.Windows.Shapes;
 
 namespace DevTxt.DockApp
 {
-    // Список приложений из меню «Пуск»: общий и для этого пользователя, со всеми вложенными папками, только ярлыки
+    // Список приложений: ярлыки из меню «Пуск» (общего и этого пользователя, со всеми вложенными папками)
+    // и приложения из Магазина, у которых ярлыков нет
     static class AppCatalog
     {
         const int IconPx = 96, FreshSeconds = 60;
@@ -25,7 +26,7 @@ namespace DevTxt.DockApp
         static List<AppEntry> cache;
         static bool scanning;
         static DateTime scannedAt = DateTime.MinValue;
-        static int links, icons, lastMs;
+        static int links, icons, lastMs, store;
 
         public static List<AppEntry> Cached { get { lock (gate) return cache; } }
 
@@ -34,7 +35,7 @@ namespace DevTxt.DockApp
         {
             lock (gate)
                 return cache == null ? "start menu: " + (scanning ? "still scanning" : "not scanned")
-                    : "start menu: shortcuts " + links + ", apps " + cache.Count + ", with icons " + icons + ", scanned in " + lastMs + " ms";
+                    : "start menu: shortcuts " + links + ", apps " + cache.Count + " (from the Store " + store + "), with icons " + icons + ", scanned in " + lastMs + " ms";
         }
 
         // Собирает список в фоновом потоке, если его ещё нет или он старше минуты. done зовётся в том же фоновом потоке,
@@ -62,7 +63,7 @@ namespace DevTxt.DockApp
                 }
                 foreach (Action a in call) try { a(); } catch { }
             }) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = "dock.txt apps" };
-            t.SetApartmentState(ApartmentState.STA);   // ярлыки читает WScript.Shell
+            t.SetApartmentState(ApartmentState.STA);   // ярлыки читает WScript.Shell, папку приложений — Shell.Application
             t.Start();
         }
 
@@ -100,7 +101,13 @@ namespace DevTxt.DockApp
             {
                 try { if (shell != null) Marshal.ReleaseComObject(shell); } catch { }
             }
-            List<AppEntry> list = AppRules.Clean(found);
+            // Приложения из Магазина (Параметры, Калькулятор, Терминал…): ярлыков у них нет, они в папке приложений Windows
+            var packaged = new List<AppEntry>();
+            List<KeyValuePair<string, string>> folder = Packaged.List();
+            Packaged.Remember(folder);
+            foreach (var a in folder)
+                if (AppRules.IsPackaged(a.Value)) packaged.Add(new AppEntry { Name = a.Key, App = a.Value, Target = Packaged.Folder + a.Value });
+            List<AppEntry> list = AppRules.Merge(AppRules.Clean(found), packaged);
             var old = new Dictionary<string, AppEntry>(StringComparer.OrdinalIgnoreCase);
             List<AppEntry> before = Cached;
             if (before != null) foreach (AppEntry e in before) old[e.Link + "|" + e.Icon + "|" + e.Target] = e;
@@ -109,10 +116,10 @@ namespace DevTxt.DockApp
             {
                 AppEntry same;
                 if (old.TryGetValue(e.Link + "|" + e.Icon + "|" + e.Target, out same) && same.Image != null) e.Image = same.Image;
-                else e.Image = Shell.Extract(e.Icon, IconPx) ?? Shell.Extract(e.Target, IconPx);
+                else e.Image = e.App != null ? Packaged.Extract(e.App, IconPx) : Shell.Extract(e.Icon, IconPx) ?? Shell.Extract(e.Target, IconPx);
                 if (e.Image != null) have++;
             }
-            lock (gate) { links = files.Count; icons = have; lastMs = (int)watch.ElapsedMilliseconds; }
+            lock (gate) { links = files.Count; icons = have; store = list.FindAll(delegate(AppEntry e) { return e.App != null; }).Count; lastMs = (int)watch.ElapsedMilliseconds; }
             return list;
         }
 
@@ -463,7 +470,7 @@ namespace DevTxt.DockApp
             {
                 Shut();
                 if (demo) return;
-                try { Shell.Open(e.Link); } catch { }
+                try { if (e.App != null) Packaged.Open(e.App); else Shell.Open(e.Link); } catch { }
             };
             // Питание — только в настоящем доке; в --demo кнопки нарисованы, но ничего не делают
             if (!demo) view.OnSession = delegate(string kind) { Shut(); Session.Run(kind); };

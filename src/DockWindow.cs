@@ -43,6 +43,11 @@ namespace DevTxt.DockApp
         public bool Tight, Leaving;       // Leaving — уже не нужен, гаснет и освобождает место
         // Всё, что меняется плавно: присутствие (0 — нет, 1 — есть), ширина, нажатие, ширина точки под значком
         public readonly Tween Show = new Tween(1), Wide = new Tween(0), Press = new Tween(1), DotW = new Tween(0);
+        // Перетаскивание. Float: 0 — значок на своём месте, 1 — в руке, у курсора. Shift — на сколько место ещё не доехало
+        // туда, где должно быть (соседи расступаются плавно). Gap: 1 — место в ряду занято, 0 — закрыто (значок унесли из дока).
+        public readonly Tween Float = new Tween(0), Shift = new Tween(0), Gap = new Tween(1);
+        public double FloatX, FloatY;     // где середина значка, пока он в руке
+        public System.Windows.Media.Effects.DropShadowEffect Shadow;
         public long BounceAt = -1;        // когда значок начал подпрыгивать (программа запускается); −1 — не прыгает
         public int BounceStop = -1;       // после какого прыжка остановиться: окно появилось
 
@@ -64,7 +69,10 @@ namespace DevTxt.DockApp
         const int AppearMs = 250, LeaveMs = 180, PressDownMs = 70, PressUpMs = 220, BounceMs = 560, BounceCycles = 3, WidgetFadeMs = 120;
         const double PressScale = 0.92, BounceHeight = 0.2;
         const int MenuTitleChars = 38;
-        const string AppsTip = "Приложения";
+        const string AppsTip = "Приложения", UnpinTip = "Открепить";
+        // Перетаскивание: поднятый значок чуть крупнее и с тенью; соседи расступаются, отпущенный садится на место
+        const double LiftScale = 1.12, LiftShadow = 0.5, DropSlack = 0.12;
+        const int LiftMs = 140, SettleMs = 220, PartMs = 200;
 
         readonly bool demo, headless;
         readonly Store store;
@@ -87,6 +95,19 @@ namespace DevTxt.DockApp
         double size, gap, winW, winH, restW, baseline, panelTop, panelLeft, panelRight, lastHiddenY = double.NaN;
         IntPtr fg;        // окно, которое сейчас впереди: под его значком точка шире и ярче
         Slot pressed;     // значок или виджет, на котором сейчас держат кнопку мыши
+        Slot armed, drag; // armed — закреплённый значок нажат и его можно поднять; drag — он уже в руке
+        Point armAt;      // где нажали
+        double grabX, grabY;   // от середины значка до курсора в момент, когда его подняли
+        int dragTo = -1;  // на каком месте среди закреплённых значок окажется, если отпустить
+        bool dragOut;     // унесён высоко над доком: отпустить — открепить
+
+        // Окна программы над её значком
+        PreviewWindow preview;
+        Slot previewFor;
+        int previewPolls;
+        readonly DispatcherTimer previewOpen = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PreviewRules.OpenMs) };
+        readonly DispatcherTimer previewShut = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PreviewRules.CloseMs) };
+        readonly DispatcherTimer previewPoll = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
 
         // Виджеты: что пришло из хаба от kapsula.txt и что док узнал у Windows сам
         MediaInfo media;
@@ -161,6 +182,16 @@ namespace DevTxt.DockApp
             strip.MouseDown += StripDown;
             strip.MouseUp += StripUp;
             strip.MouseLeave += delegate { Release(); };
+            strip.MouseMove += StripMove;
+            strip.LostMouseCapture += delegate { armed = null; if (drag != null) CancelDrag(); };
+            previewOpen.Tick += delegate { previewOpen.Stop(); PreviewDue(); };
+            previewShut.Tick += delegate { previewShut.Stop(); PreviewLeft(); };
+            previewPoll.Tick += delegate
+            {
+                // Окно закрывали крестиком в панели: смотрим чаще обычного, пока оно не исчезнет
+                if (--previewPolls <= 0 || ended || preview == null || !preview.Shown) previewPoll.Stop();
+                if (!ended && !demo) Refresh();
+            };
             strip.MouseWheel += delegate(object s, MouseWheelEventArgs e)
             {
                 Slot at = SlotAt(e.GetPosition(this).X);
@@ -258,6 +289,8 @@ namespace DevTxt.DockApp
             if (ended) return;
             ended = true;
             refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop();
+            previewOpen.Stop(); previewShut.Stop(); previewPoll.Stop();
+            if (preview != null) { try { preview.Close(); } catch { } preview = null; }
             StopLoop();
             Win.Unwatch();
             // Док уходит — панель задач и кнопка Windows возвращаются такими, какими были
@@ -310,6 +343,7 @@ namespace DevTxt.DockApp
                 items = now;
                 Rebuild();
                 hub.PublishApps(items);
+                SyncPreview();
                 return;
             }
             // Те же значки — обновляем только списки окон и точки под значками
@@ -320,6 +354,7 @@ namespace DevTxt.DockApp
                 if (s != null) s.Item = item;
             }
             SyncDots();
+            SyncPreview();
         }
 
         void ForegroundChanged()
@@ -471,22 +506,22 @@ namespace DevTxt.DockApp
         }
 
         // Значок программы; если его нет — цветная плитка с первой буквой, как в core.txt
-        FrameworkElement Face(DockItem item)
+        FrameworkElement Face(DockItem item, double px)
         {
-            ImageSource img = demo ? null : Shell.Icon(item.Icon) ?? Shell.Icon(item.Path);
+            ImageSource img = demo ? null : Shell.IconOf(item);
             if (img != null)
             {
-                var image = new Image { Source = img, Width = size, Height = size };
+                var image = new Image { Source = img, Width = px, Height = px };
                 RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
                 return image;
             }
-            return Glyphs.LetterTile(item.Name, size, items.IndexOf(item));
+            return Glyphs.LetterTile(item.Name, px, items.FindIndex(delegate(DockItem i) { return i.Key == item.Key; }));
         }
 
         Slot IconSlot(DockItem item)
         {
             var slot = new Slot { Kind = SlotKind.Item, Id = "item:" + item.Key, Item = item, W = size, Built = size };
-            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { Face(item) } };
+            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { Face(item, size) } };
             root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
             slot.Root = root;
             slot.Dot = new Border { Width = 0, Height = DotSize, CornerRadius = new CornerRadius(DotSize / 2), Background = Ui.Label, RenderTransform = slot.DotMove, IsHitTestVisible = false };
@@ -735,6 +770,8 @@ namespace DevTxt.DockApp
             stage.Children.Remove(s.Root);
             if (s.Dot != null) stage.Children.Remove(s.Dot);
             if (pressed == s) pressed = null;
+            if (armed == s) armed = null;
+            if (previewFor == s) ClosePreview(true);
         }
 
         // Приводит док к тому, что должно быть видно сейчас. Ничего не сносит: места, которые остались, остаются
@@ -831,6 +868,7 @@ namespace DevTxt.DockApp
             }
             slots.Clear();
             slots.AddRange(merged);
+            if (drag != null) KeepDragOrder();
 
             double panelH = PadTop + size + DotZone;
             winW = work.Width;
@@ -932,23 +970,24 @@ namespace DevTxt.DockApp
             for (int i = 0; i < n; i++)
             {
                 Slot s = slots[i];
-                if (s.Show.Running || s.Wide.Running || s.Press.Running || s.DotW.Running || s.BounceAt >= 0) busy = true;
+                if (s.Show.Running || s.Wide.Running || s.Press.Running || s.DotW.Running || s.BounceAt >= 0 || s.Float.Running || s.Shift.Running || s.Gap.Running) busy = true;
                 k[i] = s.Show.Value(now); w[i] = s.Wide.Value(now); press[i] = s.Press.Value(now); dot[i] = s.DotW.Value(now);
             }
+            if (drag != null) busy = true;   // значок в руке идёт за курсором каждый кадр
             if (!force && !busy && !moving && cursorU == lastU && amount == lastAmount) return;
             moving = busy;
             lastU = cursorU; lastAmount = amount;
 
-            double[] rw = new double[n], mw = new double[n], scale = new double[n];
+            double[] rw = new double[n], mw = new double[n], scale = new double[n], part = new double[n];
             double total = 0;
-            for (int i = 0; i < n; i++) { rw[i] = (w[i] + gap) * k[i]; total += rw[i]; }
+            for (int i = 0; i < n; i++) { part[i] = k[i] * slots[i].Gap.Value(now); rw[i] = (w[i] + gap) * part[i]; total += rw[i]; }
             restW = total;
             double a = 0, range = RangeSlots * (size + gap);
             for (int i = 0; i < n; i++)
             {
                 double centre = a + rw[i] / 2;
                 scale[i] = !slots[i].Icon ? 1 : 1 + amount * (Magnify.Scale(cursorU - centre, range, MaxScale) - 1);
-                mw[i] = (w[i] * scale[i] + gap) * k[i];
+                mw[i] = (w[i] * scale[i] + gap) * part[i];
                 a += rw[i];
             }
             double from, to;
@@ -971,9 +1010,10 @@ namespace DevTxt.DockApp
                 s.Now = scale[i];
                 s.Left = s.Centre - w[i] * scale[i] / 2;
                 if (s.Root.Opacity != k[i]) s.Root.Opacity = k[i];
+                double shift = s.Shift.Value(now);   // место переехало — значок доезжает до него плавно
                 if (s.Kind == SlotKind.Line)
                 {
-                    s.Move.X = s.Centre - 0.5;
+                    s.Move.X = s.Centre - 0.5 + shift;
                     s.Move.Y = baseline - size + (size - ((Rectangle)s.Root).Height) / 2;
                     continue;
                 }
@@ -981,12 +1021,12 @@ namespace DevTxt.DockApp
                 if (s.Kind == SlotKind.Widget)
                 {
                     s.Scale.ScaleX = s.Scale.ScaleY = (1 - (1 - press[i]) / 2) * grow;   // капсула широкая — сжимается вдвое слабее значка
-                    s.Move.X = s.Centre - s.W / 2;
+                    s.Move.X = s.Centre - s.W / 2 + shift;
                     s.Move.Y = baseline - size;
                     continue;
                 }
-                s.Scale.ScaleX = s.Scale.ScaleY = scale[i] * press[i] * grow;
-                s.Move.X = s.Centre - size / 2;   // значок растёт от своего низа и от середины своего места
+                double sc = scale[i] * press[i] * grow;
+                double mx = s.Centre - size / 2 + shift;   // значок растёт от своего низа и от середины своего места
                 double y = baseline - size - size * scale[i] * grow * (1 - press[i]) / 2;   // нажатие сжимает к середине значка, а не к полу
                 if (s.BounceAt >= 0)
                 {
@@ -996,12 +1036,28 @@ namespace DevTxt.DockApp
                     if (hop >= (s.BounceStop >= 0 ? Math.Min(BounceCycles, s.BounceStop) : BounceCycles) || Ui.ReducedMotion) { s.BounceAt = -1; s.BounceStop = -1; }
                     else y -= size * BounceHeight * (1 - 0.2 * hop) * Tween.Bounce(t, BounceMs);
                 }
+                // В руке: значок чуть крупнее, с тенью, его середина — у курсора. Между местом и рукой он переходит плавно.
+                double f = s.Float.Value(now);
+                if (f > 0)
+                {
+                    double up = LiftScale * grow;
+                    sc += (up - sc) * f;
+                    mx += (s.FloatX - size / 2 - mx) * f;
+                    y += (s.FloatY - size + size * up / 2 - y) * f;
+                }
+                if (s.Shadow != null)
+                {
+                    s.Shadow.Opacity = LiftShadow * f;
+                    if (f <= 0 && s != drag) { s.Root.Effect = null; s.Shadow = null; Panel.SetZIndex(s.Root, 4); }   // сел на место
+                }
+                s.Scale.ScaleX = s.Scale.ScaleY = sc;
+                s.Move.X = mx;
                 s.Move.Y = y;
                 if (s.Dot == null) continue;
                 double dw = Math.Max(0, dot[i]);
                 s.Dot.Width = dw;
-                s.Dot.Opacity = k[i] * (0.72 + 0.28 * Math.Max(0, Math.Min(1, (dw - DotSize) / (DotWide - DotSize))));
-                s.DotMove.X = s.Centre - dw / 2;
+                s.Dot.Opacity = k[i] * (1 - f) * (0.72 + 0.28 * Math.Max(0, Math.Min(1, (dw - DotSize) / (DotWide - DotSize))));
+                s.DotMove.X = s.Centre + shift - dw / 2;
                 s.DotMove.Y = baseline + (DotZone - DotSize) / 2 - 1;
             }
             PlaceTip();
@@ -1066,11 +1122,14 @@ namespace DevTxt.DockApp
             tipOverride = null;
             if (hover >= 0 && slots[hover].Hover != null) slots[hover].Hover(true);
             ShowTip();
+            PreviewHover();
         }
 
         void ShowTip()
         {
-            bool on = hover >= 0 && !menuOpen && FillTip();
+            if (drag != null) return;   // пока значок в руке, подписью распоряжается перетаскивание
+            // Над значком открыта панель с его окнами — подпись с названием ей уступает
+            bool on = hover >= 0 && !menuOpen && !(PreviewShown && previewFor == slots[hover]) && FillTip();
             double to = on ? 1 : 0;
             if (Ui.ReducedMotion) { tip.BeginAnimation(OpacityProperty, null); tip.Opacity = to; return; }
             tip.BeginAnimation(OpacityProperty, new DoubleAnimation(to, TimeSpan.FromMilliseconds(on ? Tokens.Motion.FastMs : Tokens.Motion.PressMs)) { EasingFunction = Ui.EaseOut });
@@ -1126,8 +1185,9 @@ namespace DevTxt.DockApp
                 inside = have && !hidden && !away && InZone(p);
                 if (inside) cursorU = p.X - Origin;
             }
+            if (drag != null) { if (have) DragStep(p); else CancelDrag(); }
             bool reduced = Ui.ReducedMotion;
-            double target = inside && store.Magnify && !reduced ? 1 : 0;
+            double target = inside && drag == null && store.Magnify && !reduced ? 1 : 0;   // пока значок несут, док не растёт
             if (reduced) { amount = 0; velocity = 0; }   // «Меньше движения»: значки не растут вовсе
             else
             {
@@ -1136,9 +1196,9 @@ namespace DevTxt.DockApp
             }
             Place();
 
-            if (!menuOpen) SetHover(inside ? IndexAt(p.X) : -1);
+            if (!menuOpen) SetHover(inside && drag == null ? IndexAt(p.X) : -1);
 
-            if (!inside && !menuOpen && !moving && Math.Abs(amount - target) < 0.0005 && Math.Abs(velocity) < 0.005)
+            if (!inside && !menuOpen && !moving && drag == null && Math.Abs(amount - target) < 0.0005 && Math.Abs(velocity) < 0.005)
             {
                 amount = 0; velocity = 0;
                 Place();
@@ -1179,7 +1239,7 @@ namespace DevTxt.DockApp
                 edgeHits = onEdge ? edgeHits + 1 : 0;
                 if (edgeHits >= (AtScreenEdge ? 1 : 3)) { edgeHits = 0; lastInside = now; SetHidden(false); StartLoop(); }
             }
-            else if (menuOpen || InZone(p)) lastInside = now;
+            else if (menuOpen || drag != null || InZone(p) || (preview != null && preview.Hot)) lastInside = now;
             else if (now - lastInside > HideAfterMs) SetHidden(true);
         }
 
@@ -1187,6 +1247,7 @@ namespace DevTxt.DockApp
         {
             if (hidden == hide) return;
             hidden = hide;
+            if (hide) ClosePreview(true);
             Glide();
         }
 
@@ -1197,6 +1258,7 @@ namespace DevTxt.DockApp
             bool want = fullscreen || store.Bar == "modern";
             if (want == away) return;
             away = want;
+            if (away) ClosePreview(true);   // игра или видео на весь экран — панели с окнами тоже не место
             if (headless || demo) return;
             if (!away) Show();
             Glide();
@@ -1224,28 +1286,346 @@ namespace DevTxt.DockApp
         // отпускание возвращает мягко (220 мс) — видно, что док услышал.
         void StripDown(object sender, MouseButtonEventArgs e)
         {
-            Slot s = SlotAt(e.GetPosition(this).X);
             e.Handled = true;
+            if (drag != null) { CancelDrag(); return; }   // другая кнопка, пока значок в руке, — отмена
+            Slot s = SlotAt(e.GetPosition(this).X);
             if (e.ChangedButton == MouseButton.Left)
             {
                 Release();
+                Disarm();
+                ClosePreview(false);
                 pressed = s;
                 if (s == null) return;
                 Go(s.Press, PressScale, PressDownMs);
                 Kick();
+                // Закреплённый значок можно поднять и перенести. Курсор остаётся за доком, даже если уйдёт выше его окна.
+                if (CanDrag(s))
+                {
+                    armed = s;
+                    armAt = e.GetPosition(this);
+                    strip.CaptureMouse();
+                }
             }
             else if (e.ChangedButton == MouseButton.Middle && s != null) Act(s, true);
         }
 
         void StripUp(object sender, MouseButtonEventArgs e)
         {
-            Slot s = SlotAt(e.GetPosition(this).X);
             e.Handled = true;
+            if (drag != null)
+            {
+                if (e.ChangedButton == MouseButton.Left) EndDrag();
+                return;
+            }
+            Slot s = SlotAt(e.GetPosition(this).X);
             if (e.ChangedButton == MouseButton.Right) { OpenMenu(s != null && s.Kind == SlotKind.Item ? s : null); return; }
             if (e.ChangedButton != MouseButton.Left) return;
             Slot was = pressed;
+            Disarm();
             Release();
             if (was != null && was == s) Act(was, false);
+        }
+
+        // ───────── Перетаскивание закреплённых значков ─────────
+        // Нажали на закреплённый значок и повели дальше шести точек — он поднимается и идёт за курсором, соседи
+        // расступаются, показывая, куда он встанет. Отпустили в доке — новый порядок сохраняется; унесли высоко вверх —
+        // значок открепляется. Esc и любая другая кнопка мыши возвращают всё как было. Щелчок без движения — прежний щелчок.
+        bool CanDrag(Slot s)
+        {
+            return !demo && !menuOpen && !fake.HasValue && s != null && s.Kind == SlotKind.Item && !s.Leaving && s.Item != null && s.Item.Pinned;
+        }
+
+        void Disarm()
+        {
+            if (armed == null) return;
+            armed = null;
+            if (drag == null && strip.IsMouseCaptured) strip.ReleaseMouseCapture();
+        }
+
+        void StripMove(object sender, MouseEventArgs e)
+        {
+            if (armed == null || drag != null) return;
+            if (e.LeftButton != MouseButtonState.Pressed || !slots.Contains(armed) || !CanDrag(armed)) { Disarm(); return; }
+            Point p = e.GetPosition(this);
+            if (Logic.DragStarts(p.X - armAt.X, p.Y - armAt.Y)) BeginDrag(armed, p);
+        }
+
+        // Закреплённые значки по порядку — те, что есть сейчас (уходящие не в счёт)
+        List<Slot> PinnedSlots()
+        {
+            return slots.FindAll(delegate(Slot s) { return s.Kind == SlotKind.Item && !s.Leaving && s.Item != null && s.Item.Pinned; });
+        }
+
+        void Lift(Slot s)
+        {
+            if (s.Shadow == null) s.Shadow = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 16, ShadowDepth = 6, Direction = 270, Opacity = 0, Color = Colors.Black };
+            s.Root.Effect = s.Shadow;
+            Panel.SetZIndex(s.Root, 8);
+        }
+
+        void BeginDrag(Slot s, Point p)
+        {
+            armed = null;
+            int at = PinnedSlots().IndexOf(s);
+            if (at < 0) { if (strip.IsMouseCaptured) strip.ReleaseMouseCapture(); return; }
+            if (pressed == s) { Go(s.Press, 1, PressUpMs); pressed = null; }   // это уже не щелчок
+            ClosePreview(true);
+            SetHover(-1);
+            drag = s;
+            dragTo = at;
+            dragOut = false;
+            double cy = baseline - size * s.Now / 2;
+            grabX = armAt.X - s.Centre; grabY = armAt.Y - cy;
+            s.FloatX = p.X - grabX; s.FloatY = p.Y - grabY;
+            Lift(s);
+            Go(s.Float, 1, LiftMs);
+            StartLoop();
+        }
+
+        // Каждый кадр, пока значок в руке: он идёт за курсором, а его место в ряду — туда, куда он встанет
+        void DragStep(Point p)
+        {
+            Slot s = drag;
+            if (Win.KeyDown(Win.KeyEscape) || !slots.Contains(s) || s.Leaving) { CancelDrag(); return; }
+            // Значок не уходит за край окна дока: выше окна его было бы не видно
+            double lifted = size * LiftScale;
+            s.FloatX = Math.Max(lifted / 2, Math.Min(winW - lifted / 2, p.X - grabX));
+            s.FloatY = Math.Max(2 + lifted / 2, Math.Min(baseline - size / 2 + 4, p.Y - grabY));
+            bool outside = Logic.DragOut(panelTop - p.Y, size);
+            if (outside != dragOut)
+            {
+                dragOut = outside;
+                Go(s.Gap, outside ? 0 : 1, PartMs);   // место в ряду закрывается: видно, что значок уйдёт из дока
+                DragTip(outside);
+            }
+            if (dragOut) { PlaceDragTip(s); return; }
+            List<Slot> pinned = PinnedSlots();
+            int at = pinned.IndexOf(s);
+            if (at < 0) { CancelDrag(); return; }
+            double[] left = new double[pinned.Count], right = new double[pinned.Count];
+            for (int i = 0; i < pinned.Count; i++) { left[i] = pinned[i].CellL; right[i] = pinned[i].CellR; }
+            int to = Logic.DropIndex(left, right, s.FloatX, at, (size + gap) * DropSlack);
+            if (to != at) MoveSlot(s, slots.IndexOf(pinned[to]));
+            dragTo = to;
+        }
+
+        // Переставляет место в ряду. Все, кого это сдвинуло, не прыгают, а плавно доезжают оттуда, где были.
+        void MoveSlot(Slot s, int to)
+        {
+            int from = slots.IndexOf(s);
+            if (from < 0 || to < 0 || to >= slots.Count || from == to) return;
+            long now = clock.ElapsedMilliseconds;
+            var was = new Dictionary<Slot, double>();
+            foreach (Slot o in slots) was[o] = o.Centre + o.Shift.Value(now);
+            slots.RemoveAt(from);
+            slots.Insert(to, s);
+            Place(true);
+            foreach (Slot o in slots)
+            {
+                double d = was[o] - o.Centre;
+                if (Math.Abs(d) < 0.5) { o.Shift.Set(0); continue; }
+                o.Shift.Set(d);
+                Go(o.Shift, 0, PartMs);
+            }
+            Place(true);
+        }
+
+        // Док пересобрался, пока значок в руке (открылось или закрылось чьё-то окно): место значка остаётся там, куда его донесли
+        void KeepDragOrder()
+        {
+            List<Slot> pinned = PinnedSlots();
+            int at = pinned.IndexOf(drag);
+            if (at < 0)
+            {
+                // Значка больше нет среди закреплённых (открепили из другого места) — нести нечего
+                Slot s = drag;
+                drag = null; dragOut = false; dragTo = -1;
+                if (strip.IsMouseCaptured) strip.ReleaseMouseCapture();
+                DragTip(false);
+                s.Gap.Set(1);
+                Go(s.Float, 0, SettleMs);
+                return;
+            }
+            int to = Math.Max(0, Math.Min(pinned.Count - 1, dragTo));
+            dragTo = to;
+            if (to == at) return;
+            int target = slots.IndexOf(pinned[to]);
+            slots.Remove(drag);
+            slots.Insert(target, drag);
+        }
+
+        // Отпустили: в доке — значок садится на новое место и порядок сохраняется; высоко над доком — открепляется
+        void EndDrag()
+        {
+            Slot s = drag;
+            bool unpin = dragOut;
+            int to = dragTo;
+            drag = null; dragOut = false; dragTo = -1;
+            if (strip.IsMouseCaptured) strip.ReleaseMouseCapture();
+            DragTip(false);
+            lastInside = clock.ElapsedMilliseconds;
+            DockItem item = s.Item;
+            if (item == null) { s.Gap.Set(1); Go(s.Float, 0, SettleMs); Kick(); return; }
+            if (unpin)
+            {
+                store.UnpinItem(item);
+                SettingsChanged();
+                // Незапущенное гаснет там, где его отпустили. Запущенное остаётся в доке незакреплённым и садится на своё новое место.
+                if (slots.Contains(s) && !s.Leaving) { Go(s.Gap, 1, PartMs); Go(s.Float, 0, SettleMs); }
+                Kick();
+                return;
+            }
+            List<DockItem> pinned = items.FindAll(delegate(DockItem i) { return i.Pinned; });
+            int from = pinned.FindIndex(delegate(DockItem i) { return i.Key == item.Key; });
+            if (from >= 0 && to >= 0 && to < pinned.Count && to != from && store.Move(store.Pins.IndexOf(pinned[from].Pin), store.Pins.IndexOf(pinned[to].Pin)))
+            {
+                items = Collect();
+                Rebuild();
+                if (hub != null) hub.PublishApps(items);
+            }
+            Go(s.Gap, 1, PartMs);
+            Go(s.Float, 0, SettleMs);
+            Kick();
+        }
+
+        // Отмена: значок возвращается туда, откуда его взяли; ничего не сохраняется
+        void CancelDrag()
+        {
+            Slot s = drag;
+            if (s == null) return;
+            drag = null; dragOut = false; dragTo = -1;
+            if (strip.IsMouseCaptured) strip.ReleaseMouseCapture();
+            DragTip(false);
+            lastInside = clock.ElapsedMilliseconds;
+            if (slots.Contains(s) && !s.Leaving && s.Item != null)
+            {
+                string key = s.Item.Key;
+                int home = items.FindAll(delegate(DockItem i) { return i.Pinned; }).FindIndex(delegate(DockItem i) { return i.Key == key; });
+                List<Slot> pinned = PinnedSlots();
+                int at = pinned.IndexOf(s);
+                if (home >= 0 && home < pinned.Count && at >= 0 && home != at) MoveSlot(s, slots.IndexOf(pinned[home]));
+            }
+            Go(s.Gap, 1, PartMs);
+            Go(s.Float, 0, SettleMs);
+            Kick();
+        }
+
+        // Подпись «Открепить» под значком, который унесли из дока
+        void DragTip(bool on)
+        {
+            if (on)
+            {
+                tipText.Text = UnpinTip;
+                tip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                if (drag != null) PlaceDragTip(drag);
+            }
+            Fade(tip, on ? 1 : 0, on ? Tokens.Motion.FastMs : Tokens.Motion.PressMs);
+        }
+
+        void PlaceDragTip(Slot s)
+        {
+            double w = tip.DesiredSize.Width;
+            Canvas.SetLeft(tip, Math.Max(2, Math.Min(winW - w - 2, s.FloatX - w / 2)));
+            Canvas.SetTop(tip, s.FloatY + size * LiftScale / 2 + 6);
+        }
+
+        // ───────── Окна программы над значком ─────────
+        bool PreviewShown { get { return preview != null && preview.Shown; } }
+
+        bool CanPreview(Slot s)
+        {
+            return !demo && !headless && !fake.HasValue && !menuOpen && appMenu == null && drag == null && !hidden && !away
+                && s != null && s.Kind == SlotKind.Item && !s.Leaving && s.Item != null && s.Item.Running;
+        }
+
+        // Курсор перешёл на другое место дока (или ушёл с него)
+        void PreviewHover()
+        {
+            Slot s = hover >= 0 && hover < slots.Count ? slots[hover] : null;
+            bool can = CanPreview(s);
+            previewOpen.Stop();
+            if (PreviewShown)
+            {
+                previewShut.Stop();
+                if (can && s == previewFor) return;
+                if (can) { OpenPreview(s); return; }   // панель уже открыта — у соседнего значка она появляется без ожидания
+                previewShut.Start();                   // курсор мог уйти на саму панель: даём ему время дойти
+                return;
+            }
+            if (can && pressed == null) previewOpen.Start();
+        }
+
+        // Курсор простоял на значке положенное время
+        void PreviewDue()
+        {
+            Slot s = hover >= 0 && hover < slots.Count ? slots[hover] : null;
+            if (ended || pressed != null || armed != null || !inside || !CanPreview(s)) return;
+            OpenPreview(s);
+        }
+
+        // Курсор ушёл и со значка, и с панели — и не вернулся
+        void PreviewLeft()
+        {
+            if (!PreviewShown) return;
+            if (preview.Hot || (hover >= 0 && hover < slots.Count && slots[hover] == previewFor)) return;
+            ClosePreview(false);
+        }
+
+        List<PreviewCard> PreviewCards(DockItem item)
+        {
+            var list = new List<PreviewCard>();
+            foreach (IntPtr h in item.Windows)
+            {
+                if (list.Count >= PreviewRules.MaxWindows) break;
+                string title = TitleOf(h);
+                list.Add(new PreviewCard { Hwnd = h, Title = title.Length > 0 ? title : item.Name, Minimized = Win.Minimized(h) });
+            }
+            return list;
+        }
+
+        void OpenPreview(Slot s)
+        {
+            if (preview == null)
+            {
+                preview = new PreviewWindow();
+                preview.Enter = delegate { previewShut.Stop(); };
+                preview.Leave = delegate { previewShut.Stop(); previewShut.Start(); };
+                preview.Pick = delegate(IntPtr h)
+                {
+                    ClosePreview(false);
+                    try { Win.Activate(h); } catch { }
+                };
+                preview.Shut = delegate(IntPtr h)
+                {
+                    try { Win.Close(h); } catch { }
+                    previewPolls = 8;   // панель обновится, как только окно исчезнет (или останется, если программа спросила о несохранённом)
+                    previewPoll.Stop(); previewPoll.Start();
+                };
+            }
+            DockItem item = s.Item;
+            previewFor = s;
+            double top = baseline - size * (store.Magnify && !Ui.ReducedMotion ? MaxScale : 1);
+            preview.ShowFor(PreviewCards(item), delegate(double px) { return Face(item, px); }, Left + s.Centre, Top + top - PreviewWindow.Gap, work);
+            ShowTip();
+        }
+
+        // now — без угасания: док уезжает, открыто меню, впереди игра
+        void ClosePreview(bool now)
+        {
+            previewOpen.Stop(); previewShut.Stop();
+            if (!PreviewShown) { previewFor = null; return; }
+            preview.HideIt(now);
+            previewFor = null;
+            if (hover >= 0 && hover < slots.Count) ShowTip();
+        }
+
+        // Раз в секунду вместе с доком: окна программы могли открыться, закрыться, свернуться, сменить заголовок
+        void SyncPreview()
+        {
+            if (!PreviewShown) return;
+            Slot s = previewFor;
+            if (s == null || !slots.Contains(s) || !CanPreview(s)) { ClosePreview(true); return; }
+            preview.Update(PreviewCards(s.Item));
         }
 
         void Release()
@@ -1312,6 +1692,7 @@ namespace DevTxt.DockApp
             var menu = new AppMenuWindow(demo);
             appMenu = menu;
             menu.Closed += delegate { if (appMenu == menu) appMenu = null; };
+            ClosePreview(true);
             SetHover(-1);
             menu.Show();
             menu.Activate();
@@ -1349,7 +1730,8 @@ namespace DevTxt.DockApp
                         if (demo) return;
                         try { Shell.Launch(item); Bounce(slot); } catch { }
                     });
-                    menu.Item("Показать в папке", false, delegate { if (!demo) try { Shell.Reveal(item.Path); } catch { } });
+                    // У приложения из Магазина папки, которую можно показать, нет
+                    if (item.App == null) menu.Item("Показать в папке", false, delegate { if (!demo) try { Shell.Reveal(item.Path); } catch { } });
                 }
                 if (item.Pinned) menu.Item("Открепить", false, delegate { store.UnpinItem(item); SettingsChanged(); });
                 else menu.Item("Закрепить", false, item.CanPin ? new Action(delegate { store.PinItem(item); SettingsChanged(); }) : null);
@@ -1375,6 +1757,9 @@ namespace DevTxt.DockApp
         {
             if (menuOpen) return;
             Release();
+            Disarm();
+            if (drag != null) CancelDrag();
+            ClosePreview(true);
             PopMenu menu = BuildMenu(slot);
             menuOpen = true;
             ShowTip();
@@ -1440,7 +1825,9 @@ namespace DevTxt.DockApp
 
         // Рисует док в файл PNG, не показывая его на экране. over — над каким значком будто бы курсор (−1 — покой);
         // overWidget — над каким виджетом (null — ни над каким).
-        public void Shot(string file, int over, string overWidget, bool withMenu)
+        // withPreviews — над значком панель с его окнами (выдуманными); dragged — какой закреплённый значок будто бы несут
+        // (−1 — никакой), draggedOut — его унесли высоко над доком.
+        public void Shot(string file, int over, string overWidget, bool withMenu, bool withPreviews, int dragged, bool draggedOut)
         {
             Content = null;
             int index = -1, n = 0;
@@ -1457,6 +1844,46 @@ namespace DevTxt.DockApp
                 FillTip();
                 tip.Opacity = withMenu ? 0 : 1;
             }
+            List<Slot> pinnedNow = PinnedSlots();
+            if (dragged >= 0 && dragged < pinnedNow.Count && index < 0)
+            {
+                Slot s = pinnedNow[dragged];
+                Lift(s);
+                s.Float.Set(1);
+                if (draggedOut)
+                {
+                    s.Gap.Set(0);
+                    s.FloatX = s.Centre + size * 0.3; s.FloatY = 2 + size * LiftScale / 2 + 6;
+                    Place(true);
+                    tipText.Text = UnpinTip;
+                    tip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    PlaceDragTip(s);
+                    tip.Opacity = 1;
+                }
+                else
+                {
+                    Slot target = pinnedNow[Math.Min(pinnedNow.Count - 1, dragged + 2)];
+                    s.FloatX = target.Centre - size * 0.22; s.FloatY = baseline - size / 2 - size * 0.4;
+                    MoveSlot(s, slots.IndexOf(target));
+                }
+            }
+            // Панель с окнами программы — та же, что в настоящем доке, только окна в ней нарисованы
+            FrameworkElement panes = null;
+            if (index >= 0 && withPreviews && !withMenu && slots[index].Kind == SlotKind.Item && slots[index].Item.Running)
+            {
+                DockItem item = slots[index].Item;
+                double[] aspects = { 1.6, 1.33, 1.78, 0.8, 1.6 };
+                var cards = new List<PreviewCard>();
+                foreach (IntPtr one in item.Windows)
+                {
+                    if (cards.Count >= PreviewRules.MaxWindows) break;
+                    string title = TitleOf(one);
+                    cards.Add(new PreviewCard { Hwnd = one, Title = title.Length > 0 ? title : item.Name, Aspect = aspects[cards.Count], Minimized = cards.Count == 2 });
+                }
+                panes = new PreviewView(cards, delegate(double px) { return Face(item, px); }, true, Tokens.Radius.Block).Root;
+                panes.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                tip.Opacity = 0;
+            }
             // Меню — то же самое, что по правому щелчку, только нарисованное в этот же снимок
             FrameworkElement box = null;
             if (index >= 0 && withMenu)
@@ -1469,6 +1896,7 @@ namespace DevTxt.DockApp
             // Сверху — ровно столько места, сколько нужно подписи или меню: окно выше из-за многострочных подписей виджетов
             double above = index >= 0 && !withMenu && !slots[index].Icon ? WidgetTipGap + tip.DesiredSize.Height : size * (MaxScale - 1) + TipGap + TipH;
             double top = box != null ? size * (MaxScale - 1) + box.DesiredSize.Height - 36 + 6 + 24 : above + TopRoom + 36;
+            if (panes != null) top = size * (MaxScale - 1) + PreviewWindow.Gap + panes.DesiredSize.Height + 24;
             // Снимок — не весь экран, а док с полями
             double full = 0;
             foreach (Slot s in slots) full += s.W + gap;
@@ -1486,6 +1914,14 @@ namespace DevTxt.DockApp
                 box.Margin = new Thickness((w - winW) / 2 + slots[index].Centre - (box.DesiredSize.Width - 36) / 2, h - winH + baseline - size * slots[index].Now - 6 - (box.DesiredSize.Height - 36), 0, 0);
                 root.Children.Add(box);
             }
+            if (panes != null)
+            {
+                double pw = panes.DesiredSize.Width, ph = panes.DesiredSize.Height;
+                panes.HorizontalAlignment = HorizontalAlignment.Left; panes.VerticalAlignment = VerticalAlignment.Top;
+                panes.Margin = new Thickness(Math.Max(8, Math.Min(w - pw - 8, (w - winW) / 2 + slots[index].Centre - pw / 2)), h - winH + baseline - size * slots[index].Now - PreviewWindow.Gap - ph, 0, 0);
+                panes.Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 18, ShadowDepth = 4, Direction = 270, Opacity = 0.4, Color = Colors.Black };
+                root.Children.Add(panes);
+            }
             Program.Save(root, w, h, 2, file);
         }
 
@@ -1498,7 +1934,7 @@ namespace DevTxt.DockApp
                 if (i.Pinned) pinned++;
                 if (i.Running) running++;
                 windows += i.Windows.Count;
-                if ((Shell.Icon(i.Icon) ?? Shell.Icon(i.Path)) != null) icons++;
+                if (Shell.IconOf(i) != null) icons++;
             }
             return "dock.txt " + Program.VersionText + ": items " + items.Count + " (pinned " + pinned + ", running " + running + "), windows " + windows + ", icons " + icons + "/" + items.Count
                 + ", icon size " + size + ", window " + Math.Round(Width) + "x" + Math.Round(Height) + " at " + Math.Round(Left) + "," + Math.Round(Top) + ", hub " + (hub != null && hub.Online ? "online" : "offline")
