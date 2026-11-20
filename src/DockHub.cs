@@ -54,7 +54,7 @@ namespace DevTxt.DockApp
             link.OnStatus = delegate(bool on) { if (!on) window.Dispatcher.BeginInvoke(new Action(delegate { window.HubGone(); })); };
             // Семья — после своих обработчиков и до link.Start(): она добавляет к ним core.family, hub.apps и tray.run.
             // Changed приходит в потоке хаба, а решает окно — в своём.
-            family = new Family(link, "dock");
+            family = new Family(link, "dock", delegate { window.Dispatcher.BeginInvoke(new Action(delegate { window.Quit(); })); });   // «Закрыть» в трее core.txt
             family.Changed = delegate { window.Dispatcher.BeginInvoke(new Action(delegate { window.FamilyChanged(); })); };
         }
 
