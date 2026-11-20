@@ -3,14 +3,17 @@
 //   --demo              выдуманные значки; окна, диск, реестр и хаб не трогаются
 //   --nohub             вместе с --demo: без выдуманных данных из хаба — только часы, громкость и батарея
 //   --shot файл.png     нарисовать док в файл и выйти (обычно вместе с --demo); --hover N — будто курсор над значком N,
-//                       --hover music|calendar|weather|volume|battery|clock|apps — над виджетом или кнопкой меню; --menu — с меню этого значка
+//                       --hover music|calendar|weather|volume|battery|clock|apps — над виджетом или кнопкой меню; --menu — с меню этого значка.
+//                       Музыка, календарь и погода по умолчанию выключены (их показывает остров kapsula.txt): с --demo
+//                       и --hover над одним из них он в снимке включён — каким его видит тот, кто его включил
 //                       --previews — вместе с --demo и --hover N: над значком панель с его окнами (окна нарисованные);
 //                       --drag N — вместе с --demo: закреплённый значок N будто бы несут на два места правее; --out — унесли из дока
 //   --apps              вместе с --shot: нарисовать меню приложений; --query текст — с этим текстом в поиске
-//   --selftest          проверить сборку значков из окон, закрепление, увеличение, настройки, виджеты, счётчики, названия и поиск в меню; код выхода 0 — всё в порядке
+//   --selftest          проверить сборку значков из окон, закрепление, увеличение, настройки, виджеты, счётчики, названия и поиск в меню,
+//                       пункты для трея и клавиши core.txt и уход из-под игры на весь экран; код выхода 0 — всё в порядке
 //   --probe [файл]      запуститься по-настоящему, провести по доку выдуманный курсор, записать, что док увидел, и выйти
 //   --headless          работать, не показывая окна (для проверок с хабом); --seconds N — выйти через N секунд
-//   --testhook          принимать из хаба проверочные команды test.act и test.quit
+//   --testhook          принимать из хаба проверочные команды test.act, test.state и test.quit
 //   --state папка       хранить state.json в этой папке, а не в %APPDATA%\dev.txt\dock (для проверок)
 // Переменная DOCK_HUB_PORT — хаб на другом порту, рядом с настоящим core.txt (тоже для проверок).
 using System;
@@ -68,6 +71,8 @@ namespace DevTxt.DockApp
                 store.Pins = Shell.TaskbarPins();
                 store.Save();
             }
+            // Снимок над музыкой, календарём или погодой: в выдуманном доке этот виджет включён (по умолчанию его нет)
+            if (demo && !string.IsNullOrEmpty(overWidget) && Array.IndexOf(Store.IslandKeys, WidgetList.Key(overWidget)) >= 0) store.Flags[WidgetList.Key(overWidget)] = true;
             // Док живёт весь день: случайная ошибка в одном щелчке не должна его ронять — записываем её и работаем дальше
             app.DispatcherUnhandledException += delegate(object s, DispatcherUnhandledExceptionEventArgs e)
             {
@@ -210,9 +215,17 @@ namespace DevTxt.DockApp
             Check(Logic.Player(players, "Spotify") == players[1] && Logic.Player(players, "spotify.exe") == players[1] && Logic.Player(players, "CHROME.EXE") == players[0], "the player is found by its name or its file");
             Check(Logic.Player(players, "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify") == players[1] && Logic.Player(players, "музыка") == players[2], "…and by a longer id that contains it, or a part of its name");
             Check(Logic.Player(players, "") == null && Logic.Player(players, null) == null && Logic.Player(players, "Winamp") == null && Logic.Player(null, "x") == null, "no player in the dock — nothing to bring forward");
-            Check(Logic.IsFullscreen(0, 0, 1920, 1080, 1920, 1080, false), "borderless window over the whole screen is fullscreen");
-            Check(!Logic.IsFullscreen(-8, -8, 1928, 1088, 1920, 1080, true), "a maximised window with a caption is not");
-            Check(!Logic.IsFullscreen(0, 0, 1920, 1040, 1920, 1080, false), "a window that leaves the taskbar visible is not");
+            // ── Игра или видео на весь экран: общее правило семьи (FullScreen в Family.cs) и когда док уходит ──
+            Check(FullScreen.Is(0, 0, 1920, 1080, 0, 0, 1920, 1080, false, false, false), "a borderless window exactly over its monitor is fullscreen");
+            Check(!FullScreen.Is(-8, -8, 1928, 1088, 0, 0, 1920, 1080, true, true, true) && !FullScreen.Is(0, 0, 1920, 1080, 0, 0, 1920, 1080, false, true, false), "a maximised window is not, with a caption or without (Discord, Steam when the taskbar is hidden)");
+            Check(!FullScreen.Is(0, 0, 1920, 1040, 0, 0, 1920, 1080, false, false, false) && !FullScreen.Is(0, 0, 1920, 1080, 0, 0, 1920, 1080, false, false, true), "a window that leaves the taskbar visible or has a sizing frame is not");
+            Check(FullScreen.Is(1920, 0, 4480, 1440, 1920, 0, 4480, 1440, false, false, false), "a game on the second monitor counts by its own monitor");
+            Check(FamilyRules.GameAway(false, false, true, -1, true) && !FamilyRules.GameAway(false, true, false, 100, true), "without core.txt the dock follows its own check and ignores a stale word from core.txt");
+            Check(FamilyRules.GameAway(true, true, false, -1, true) && FamilyRules.GameAway(true, true, false, 99999, true) && !FamilyRules.GameAway(true, false, false, 10, true), "with core.txt its core.family.game decides");
+            Check(FamilyRules.GameAway(true, false, true, 0, true) && FamilyRules.GameAway(true, false, true, FamilyRules.GameGraceMs - 1, true), "right after the foreground window changed the dock steps aside on its own check, before core.txt has spoken");
+            Check(!FamilyRules.GameAway(true, false, true, FamilyRules.GameGraceMs, true) && !FamilyRules.GameAway(true, false, true, -1, true) && FamilyRules.GameGraceMs <= 5000, "after a few seconds only core.txt keeps it away; with no switch seen, its word alone");
+            Check(!FamilyRules.GameAway(true, true, true, 0, false) && !FamilyRules.GameAway(true, true, false, -1, false) && !FamilyRules.GameAway(false, false, true, -1, false), "a game on another monitor does not move the dock off the main one — with core.txt or without");
+            Check(Win.OnDockScreen(IntPtr.Zero), "no window ahead: the monitor check does not stand in the way, the full-screen rule alone decides");
 
             // ── Закрепление переживает перезапуск ──
             string dir = Path.Combine(Path.GetTempPath(), "dock.txt-test-" + System.Diagnostics.Process.GetCurrentProcess().Id);
@@ -395,9 +408,19 @@ namespace DevTxt.DockApp
             if (wlist != null && wlist.Length == 7)
             {
                 string wkeys = "";
-                foreach (Dictionary<string, object> it in wlist) { wkeys += it["key"] + " "; Check((string)it["type"] == "switch" && it["value"] is bool && (bool)it["value"] && ((string)it["label"]).Length > 0, "every widget setting is a switch, on by default, with a label"); }
+                foreach (Dictionary<string, object> it in wlist) { wkeys += it["key"] + " "; Check((string)it["type"] == "switch" && it["value"] is bool && (bool)it["value"] == Store.DefaultOn((string)it["key"]) && ((string)it["label"]).Length > 0 && !it.ContainsKey("section"), "every widget setting is a switch with a label and stays on the dock's own page"); }
                 Check(wkeys == "widgetMusic widgetCalendar widgetWeather widgetVolume widgetBattery widgetClock badges ", "widget keys, got " + wkeys);
                 Check((string)((Dictionary<string, object>)wlist[6])["label"] == "Счётчики непрочитанного", "the counters switch is named «Счётчики непрочитанного»");
+                string offByDefault = "", islandHints = "", fromKapsula = "";
+                foreach (Dictionary<string, object> it in wlist)
+                {
+                    string hint = (string)it["hint"];
+                    if (!(bool)it["value"]) offByDefault += it["key"] + " ";
+                    if (hint.Contains("То же показывает остров kapsula.txt — включите, если остров спрятан")) islandHints += it["key"] + " ";
+                    if (hint.Contains("по данным kapsula.txt")) fromKapsula += it["key"] + " ";
+                }
+                Check(offByDefault == "widgetMusic widgetCalendar widgetWeather " && islandHints == offByDefault, "music, calendar and weather are off by default and their hints say the island kapsula.txt shows the same; volume, battery, clock and badges stay on, got " + offByDefault + "/ " + islandHints);
+                Check(fromKapsula == "widgetMusic widgetCalendar widgetWeather badges ", "the hints still say these widgets need data from kapsula.txt (without it they stay empty), got " + fromKapsula);
             }
             if (list != null && list.Length == 4)
             {
@@ -423,14 +446,19 @@ namespace DevTxt.DockApp
             refused = false;
             try { s.Apply("size", "big"); } catch { refused = true; }
             Check(refused && s.Size == 40, "a slider does not take text");
-            s.Apply("widgetWeather", false);
+            s.Apply("widgetVolume", false);
             s.Apply("badges", false);
-            Check(!s.On("widgetWeather") && !s.On("badges") && s.On("widgetClock"), "settings.set switches a widget and the counters off");
+            s.Apply("widgetMusic", true);
+            Check(!s.On("widgetVolume") && !s.On("badges") && s.On("widgetClock") && s.On("widgetMusic") && !s.On("widgetWeather"), "settings.set switches widgets and the counters off, and an island widget back on");
             refused = false;
             try { s.Apply("widgetClock", 1); } catch { refused = true; }
             Check(refused && s.On("widgetClock"), "a widget switch does not take a number");
             var after = (object[])((Dictionary<string, object>)((object[])s.Describe()["groups"])[2])["items"];
-            Check(!(bool)((Dictionary<string, object>)after[2])["value"] && !(bool)((Dictionary<string, object>)after[6])["value"] && (bool)((Dictionary<string, object>)after[0])["value"], "the description shows the new widget values");
+            Check((bool)((Dictionary<string, object>)after[0])["value"] && !(bool)((Dictionary<string, object>)after[2])["value"] && !(bool)((Dictionary<string, object>)after[3])["value"] && !(bool)((Dictionary<string, object>)after[6])["value"] && (bool)((Dictionary<string, object>)after[5])["value"], "the description shows the new widget values");
+            bool anySection = false;
+            foreach (object g in (object[])s.Describe()["groups"])
+                foreach (Dictionary<string, object> it in (object[])((Dictionary<string, object>)g)["items"]) if (it.ContainsKey("section")) anySection = true;
+            Check(!anySection, "no dock setting is about games or autostart, so none moves to a shared page of core.txt");
             More();
             var apps = DockHub.Apps(items);
             Check(apps.Length == 5 && (string)((Dictionary<string, object>)apps[0])["name"] == "Notes" && (bool)((Dictionary<string, object>)apps[0])["running"] && !(bool)((Dictionary<string, object>)apps[2])["running"], "dock.apps lists name, path and running");
@@ -449,14 +477,24 @@ namespace DevTxt.DockApp
             string dir = Path.Combine(Path.GetTempPath(), "dock.txt-test-w-" + System.Diagnostics.Process.GetCurrentProcess().Id);
             try
             {
+                var fresh = new Store(null);
+                Check(!fresh.On("widgetMusic") && !fresh.On("widgetCalendar") && !fresh.On("widgetWeather") && fresh.On("widgetVolume") && fresh.On("widgetBattery") && fresh.On("widgetClock") && fresh.On("badges"), "a new dock starts without music, calendar and weather (the island shows them); volume, battery, clock and badges are on");
                 var a = new Store(dir);
                 a.Apply("widgetMusic", false);
                 a.Apply("badges", false);
+                a.Apply("widgetWeather", true);
                 var b = new Store(dir);
-                Check(b.Load() && !b.On("widgetMusic") && !b.On("badges") && b.On("widgetClock") && b.On("widgetVolume"), "widget switches are saved and read back; the rest stay on");
-                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[],\"settings\":{\"autoHide\":true,\"size\":40}}");
+                Check(b.Load() && !b.On("widgetMusic") && !b.On("badges") && b.On("widgetClock") && b.On("widgetVolume") && b.On("widgetWeather") && !b.IslandMigrated, "widget switches are saved and read back; an island widget switched on stays on");
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[],\"settings\":{\"autoHide\":true,\"size\":40,\"widgetMusic\":true,\"widgetClock\":false}}");
                 var old = new Store(dir);
-                Check(old.Load() && old.AutoHide && old.Size == 40 && old.On("widgetClock") && old.On("badges"), "a state file from the previous version reads with all widgets on");
+                Check(old.Load() && old.IslandMigrated && old.AutoHide && old.Size == 40 && !old.On("widgetMusic") && !old.On("widgetCalendar") && !old.On("widgetWeather") && !old.On("widgetClock") && old.On("badges") && old.On("widgetVolume"), "a state file from the previous version: music, calendar and weather are switched off once, the rest are kept as they were");
+                Check(File.ReadAllText(Path.Combine(dir, "state.json")).Contains("\"" + Store.IslandMark + "\":true"), "the one-time switch-off is marked in state.json right away");
+                old.Apply("widgetMusic", true);
+                var again = new Store(dir);
+                Check(again.Load() && !again.IslandMigrated && again.On("widgetMusic") && !again.On("widgetCalendar") && !again.On("widgetClock"), "after that the person can switch them back on: the next start does not switch them off again");
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[]}");
+                var bare = new Store(dir);
+                Check(bare.Load() && bare.IslandMigrated && !bare.On("widgetMusic") && bare.On("widgetClock"), "an old file without settings is migrated too");
             }
             finally { try { Directory.Delete(dir, true); } catch { } }
 
@@ -537,7 +575,9 @@ namespace DevTxt.DockApp
 
             // ── Какие виджеты в доке ──
             var st = new Store(null);
-            Check(string.Join(",", WidgetList.Visible(st.On, true, true, true, true, true).ToArray()) == "music,calendar,weather,volume,battery,clock", "all widgets, the clock last");
+            Check(string.Join(",", WidgetList.Visible(st.On, true, true, true, true, true).ToArray()) == "volume,battery,clock", "by default the dock does not repeat the island: no music, calendar or weather even with kapsula.txt data");
+            foreach (string k in Store.IslandKeys) st.Apply(k, true);
+            Check(string.Join(",", WidgetList.Visible(st.On, true, true, true, true, true).ToArray()) == "music,calendar,weather,volume,battery,clock", "all widgets switched on, the clock last");
             Check(string.Join(",", WidgetList.Visible(st.On, false, false, false, true, false).ToArray()) == "volume,clock", "no hub data and no battery: volume and clock");
             Check(string.Join(",", WidgetList.Visible(st.On, false, false, false, false, false).ToArray()) == "clock", "the clock is always available");
             st.Apply("widgetClock", false);
@@ -546,6 +586,35 @@ namespace DevTxt.DockApp
             var state = DockHub.Widgets(new List<string> { "volume", "clock" }, new List<KeyValuePair<string, int>> { new KeyValuePair<string, int>("Steam", 12) });
             string wjson = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(state);
             Check(wjson == "{\"shown\":[\"volume\",\"clock\"],\"badges\":[{\"name\":\"Steam\",\"count\":12,\"text\":\"9+\"}]}", "dock.widgets lists shown widgets and badges, got " + wjson);
+
+            // ── Семья: пункты в трее core.txt, горячие клавиши, «Не беспокоить» ──
+            int toggled = 0, opened = 0;
+            List<TrayItem> tray = FamilyRules.Tray(false, true, delegate { toggled++; }, delegate { opened++; });
+            string trayJson = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(tray.ConvertAll<object>(delegate(TrayItem t) { return t.ToData(); }));
+            Check(trayJson == "[{\"key\":\"autoHide\",\"label\":\"Автоскрытие\",\"check\":false},{\"key\":\"settings\",\"label\":\"Настройки\"}]", "dock.tray: «Автоскрытие» with a check mark and «Настройки», got " + trayJson);
+            Check(tray.Count <= Family.MaxTray && !tray.Exists(delegate(TrayItem t) { return t.Key == "show"; }), "no more than four items and no «Открыть»: the dock has no window of its own");
+            bool shared = false;
+            foreach (TrayItem t in tray)
+            {
+                string l = t.Label.ToLowerInvariant();
+                if (l.Contains("windows") || l.Contains("обновл") || l.Contains("беспокоить") || l.Contains("core.txt") || l.Contains("выход") || l.Contains("dock")) shared = true;
+            }
+            Check(!shared, "autostart, updates, do-not-disturb, «Открыть core.txt», exit and the app name are left to core.txt's own menu");
+            tray[0].Run();
+            tray[1].Run();
+            Check(toggled == 1 && opened == 1, "tray.run autoHide toggles auto-hide, tray.run settings opens core.txt");
+            Check(FamilyRules.Tray(true, true, null, null)[0].Check == true && FamilyRules.Tray(false, true, null, null)[0].Check == false && FamilyRules.Tray(true, true, null, null)[1].Check == null, "the check mark follows the auto-hide setting; «Настройки» is a plain action");
+            List<TrayItem> compact = FamilyRules.Tray(true, false, null, null);
+            string compactJson = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(compact.ConvertAll<object>(delegate(TrayItem t) { return t.ToData(); }));
+            Check(!compact[0].Enabled && compact[1].Enabled && tray[0].Enabled && compactJson == "[{\"key\":\"autoHide\",\"label\":\"Автоскрытие\",\"check\":true,\"enabled\":false},{\"key\":\"settings\",\"label\":\"Настройки\"}]",
+                "with the compact Windows bar the dock is not on screen: «Автоскрытие» is shown but greyed out, «Настройки» still work, got " + compactJson);
+            Check(FamilyRules.CorePage == "app:dock", "«Настройки» open the dock's own page in core.txt");
+            List<KeyInfo> keys = FamilyRules.Keys(true, true);
+            Check(keys.Count == 1 && keys[0].Id == "winKey" && keys[0].Label == "Меню приложений" && keys[0].Keys == "Win" && KeyNames.Normal("win") == keys[0].Keys && keys[0].On, "dock.keys: the Windows key opens «Меню приложений»");
+            Check(!FamilyRules.Keys(false, true)[0].On && !FamilyRules.Keys(true, false)[0].On && !FamilyRules.Keys(false, false)[0].On, "the Windows key is listed as off unless dock.txt replaces the taskbar and the setting is on");
+            string keysJson = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(keys[0].ToData());
+            Check(keysJson == "{\"id\":\"winKey\",\"label\":\"Меню приложений\",\"keys\":\"Win\",\"on\":true}", "a key serialises as the protocol shows it, got " + keysJson);
+            Check(FamilyRules.BadgePops(true, false) && !FamilyRules.BadgePops(true, true) && !FamilyRules.BadgePops(false, false), "a new badge pops out, but not while «Не беспокоить» is on; a changed number never pops");
 
             // ── Меню приложений ──
             var found = new List<AppEntry>

@@ -128,7 +128,7 @@ namespace DevTxt.DockApp
         double amount, velocity, cursorU, lastU = double.NaN, lastAmount = double.NaN;
         bool looping, inside, menuOpen, hidden, fullscreen, away, moving;
         int hover = -1, edgeHits;
-        long lastFrame, lastInside;
+        long lastFrame, lastInside, lastSwitch = -1;   // lastSwitch — когда впереди сменилось окно (−1 — ещё не менялось)
         string tipOverride;
 
         // hubData — для --demo: показывать ли выдуманные музыку, погоду, календарь и счётчики
@@ -274,12 +274,14 @@ namespace DevTxt.DockApp
             SyncAway();
         }
 
-        // Одиночное нажатие кнопки Windows. Поверх игры или видео на весь экран меню приложений не открываем
-        // (закрыть уже открытое — можно).
+        // Одиночное нажатие кнопки Windows. Поверх игры или видео на весь экран (на любом мониторе: фокус у игры) не
+        // открывается ничего: перехватчик уже не пустил нажатие в «Пуск», а меню приложений не открываем мы. Игра само
+        // нажатие получила и фокус не теряет. Закрыть уже открытое меню можно. Ответ нужен в эту же секунду, поэтому
+        // проверяем сами — общим правилом семьи.
         void WinPressed()
         {
             if (ended) return;
-            if (appMenu == null && Win.FullscreenAhead()) return;
+            if (appMenu == null && FullScreen.Ahead()) return;
             ToggleApps();
         }
 
@@ -320,13 +322,8 @@ namespace DevTxt.DockApp
         // Раз в пять секунд заодно — батарея и не сменилось ли устройство звука.
         void Refresh()
         {
-            bool full = Win.FullscreenAhead();
+            SyncGame();
             fg = Win.Foreground();
-            if (full != fullscreen)
-            {
-                fullscreen = full;   // игра или видео на весь экран — док уезжает за край
-                SyncAway();
-            }
             if (++ticks % SlowPollTicks == 0)
             {
                 BatteryInfo b = Power.Read();
@@ -359,6 +356,7 @@ namespace DevTxt.DockApp
 
         void ForegroundChanged()
         {
+            lastSwitch = clock.ElapsedMilliseconds;
             if (fgPending || ended) return;
             fgPending = true;
             Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate { fgPending = false; if (!ended) Refresh(); }));
@@ -435,6 +433,72 @@ namespace DevTxt.DockApp
             Rebuild();
         }
 
+        // ───────── Семья dev.txt ─────────
+        // Впереди игра или видео на весь экран? С core.txt решает он (core.family.game), без него — своя проверка
+        // тем же правилом семьи (FullScreen в Family.cs). Само решение — FamilyRules.GameAway.
+        bool GameNow()
+        {
+            bool online = hub != null && hub.CoreOnline;
+            long since = lastSwitch < 0 ? -1 : clock.ElapsedMilliseconds - lastSwitch;
+            // Док стоит только на главном мониторе: игра на другом ему не мешает. На каком мониторе окно впереди,
+            // core.family не говорит — смотрим сами
+            bool screen = Win.OnDockScreen(Win.Foreground());
+            // При core.txt своя проверка нужна только сразу после смены окна впереди — иначе её и не делаем
+            bool local = screen && (!online || (since >= 0 && since < FamilyRules.GameGraceMs)) && FullScreen.Ahead();
+            return FamilyRules.GameAway(online, online && hub.Game, local, since, screen);
+        }
+
+        // Игра пришла — док уезжает за край и прячется; ушла — возвращается
+        void SyncGame()
+        {
+            bool full = GameNow();
+            if (full == fullscreen) return;
+            fullscreen = full;
+            SyncAway();
+        }
+
+        // core.family или список приложений в хабе поменялись, связь с core.txt пропала (тогда снова своя проверка)
+        internal void FamilyChanged()
+        {
+            if (ended || demo) return;
+            SyncGame();
+        }
+
+        // «Не беспокоить» в core.txt: док не привлекает внимание движением (счётчики остаются, только не выскакивают)
+        bool Quiet { get { return hub != null && hub.Focus; } }
+
+        // Автоскрытие из меню дока и из трея core.txt (пункт dock.tray «Автоскрытие»)
+        internal void ToggleAutoHide()
+        {
+            store.AutoHide = !store.AutoHide;
+            store.Save();
+            SettingsChanged();
+        }
+
+        // Для проверок (--testhook, команда test.state): что док сейчас решил. local — своя проверка прямо сейчас,
+        // screen — окно впереди на главном мониторе, coreGame — что сказал core.txt; taskbarTaken и winKeyHooked —
+        // спрятана ли панель задач и перехвачена ли кнопка Windows (без окна — никогда)
+        internal Dictionary<string, object> TestState()
+        {
+            return HubLink.Msg("fullscreen", fullscreen, "away", away, "local", FullScreen.Ahead(), "screen", Win.OnDockScreen(Win.Foreground()),
+                "coreOnline", hub != null && hub.CoreOnline, "coreGame", hub != null && hub.Game, "quiet", Quiet,
+                "autoHide", store.AutoHide, "taskbarTaken", TaskbarSwap.Active, "winKeyHooked", WinKey.Installed);
+        }
+
+        // «Настройки» в меню дока — страница дока в core.txt. Запущенный core.txt просим через хаб; установленный, но
+        // закрытый запускаем сразу на ней (ключ --page; прежний core.txt незнакомую страницу пропускает и открывается
+        // как обычно); без core.txt — скачать его.
+        void OpenSettings()
+        {
+            bool online = hub != null && hub.Online;
+            if (!online && CoreApp.Installed)
+            {
+                try { using (Process.Start(CoreApp.Path, "--page " + FamilyRules.CorePage)) { } } catch { }
+                return;
+            }
+            CoreApp.Go(online, delegate { hub.ShowCore(); });
+        }
+
         // Нажали кнопку виджета. Сюда же приходит проверочная команда test.act (ключ --testhook).
         // Громкость отсюда не меняется: её трогают только настоящие колесо и щелчок.
         internal bool WidgetAction(string widget, string action)
@@ -452,7 +516,7 @@ namespace DevTxt.DockApp
             Rebuild();
             ApplyAutoHide();
             SyncTaskbar();
-            if (hub != null) { hub.PublishSettings(true); hub.PublishApps(items); }
+            if (hub != null) { hub.PublishSettings(true); hub.PublishApps(items); hub.PublishFamily(); }
         }
 
         int BadgeFor(DockItem item)
@@ -541,7 +605,8 @@ namespace DevTxt.DockApp
             if (slot.Badge != null)
             {
                 root.Children.Add(slot.Badge);
-                if (slot.BadgeText == null) Motion.Pop(slot.Badge);   // счётчик появился — выскакивает; сменилась цифра — просто меняется
+                // Счётчик появился — выскакивает (при «Не беспокоить» — без движения); сменилась цифра — просто меняется
+                if (FamilyRules.BadgePops(slot.BadgeText == null, Quiet)) Motion.Pop(slot.Badge);
             }
             slot.BadgeText = badge;
         }
@@ -1740,14 +1805,14 @@ namespace DevTxt.DockApp
                 menu.Line();
             }
             menu.Brand(DockSprite, "dock");
-            menu.Item("Автоскрытие", store.AutoHide, delegate { store.AutoHide = !store.AutoHide; store.Save(); SettingsChanged(); });
+            menu.Item("Автоскрытие", store.AutoHide, delegate { ToggleAutoHide(); });
             menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.Bar = store.ReplaceTaskbar ? "both" : "dock"; store.Save(); SettingsChanged(); });
             // Значки трея живут в панели задач Windows: показываем её ненадолго, сама спрячется, когда курсор уйдёт
             if (TaskbarSwap.Active) menu.Item("Значки в трее", false, delegate { TaskbarSwap.Peek(); });
             bool online = hub != null && hub.Online;
-            // Настройки дока живут в core.txt: открываем его, а если его нет — предлагаем скачать
+            // Настройки дока живут в core.txt: открываем его на странице дока, а если его нет — предлагаем скачать
             menu.Item(online || CoreApp.Installed ? "Настройки" : "Скачать core.txt — настройки и остальные приложения", false,
-                delegate { CoreApp.Go(online, delegate { hub.ShowCore(); }); });
+                delegate { if (!demo) OpenSettings(); });
             menu.Line();
             menu.Item("Выход", false, delegate { Quit(); });
             return menu;

@@ -285,13 +285,54 @@ namespace DevTxt.DockApp
             }
             return loose;
         }
+    }
 
-        // Окно на весь экран (игра, видео): закрывает его целиком и не имеет заголовка.
-        // Обычное развёрнутое окно с заголовком полноэкранным не считается.
-        public static bool IsFullscreen(int left, int top, int right, int bottom, int screenW, int screenH, bool caption)
+    // Док в семье dev.txt: пункты для общего трея core.txt, горячие клавиши для его страницы «Клавиши», когда уходить
+    // с экрана из-за игры и когда счётчику можно выскочить. Здесь только правила; в хаб их отдаёт DockHub.
+    static class FamilyRules
+    {
+        public const string TrayAutoHide = "autoHide", TraySettings = "settings", KeyApps = "winKey";
+        // Страница дока в core.txt: команда show через хаб и ключ --page, если core.txt приходится запускать
+        public const string CorePage = "app:dock";
+        // Столько миллисекунд после смены окна впереди док при core.txt уходит и по своей проверке: core.txt мог ещё не сказать
+        public const int GameGraceMs = 3000;
+
+        // Пункты дока в меню core.txt в трее. Своего окна у дока нет, поэтому «Открыть» нет; автозапуск, обновления,
+        // «Не беспокоить» и выход — общие пункты core.txt. «Настройки» открывают страницу дока в core.txt.
+        // onScreen — док стоит внизу экрана; при компактной панели Windows его не видно, и «Автоскрытие» недоступно.
+        public static List<TrayItem> Tray(bool autoHide, bool onScreen, Action toggleAutoHide, Action settings)
         {
-            return !caption && left <= 0 && top <= 0 && right >= screenW && bottom >= screenH;
+            return new List<TrayItem>
+            {
+                new TrayItem(TrayAutoHide, "Автоскрытие", autoHide, onScreen, toggleAutoHide),
+                new TrayItem(TraySettings, "Настройки", null, settings)
+            };
         }
+
+        // Сочетания дока: одиночное нажатие кнопки Windows открывает меню приложений. Действует, только когда
+        // dock.txt стоит вместо панели задач и в настройках это включено (так же решает WinKey.Sync).
+        public static List<KeyInfo> Keys(bool replaceTaskbar, bool winKey)
+        {
+            return new List<KeyInfo> { new KeyInfo(KeyApps, "Меню приложений", KeyNames.Text(0, 0x5B), replaceTaskbar && winKey) };
+        }
+
+        // Уходить ли доку с экрана: впереди игра или видео на весь экран. coreOnline — core.txt на связи и прислал
+        // core.family, coreGame — его ответ; local — своя проверка тем же правилом (FullScreen в Family.cs);
+        // sinceSwitch — сколько миллисекунд назад впереди сменилось окно (−1 — не знаем); dockScreen — окно впереди
+        // на главном мониторе, где стоит док. Игра на другом мониторе доку не мешает: он остаётся, как осталась бы там
+        // панель задач Windows. core.family не говорит, на каком мониторе игра, — это док смотрит сам.
+        // Без core.txt решает своя проверка. С ним — он, а своя помогает только в первые секунды после смены окна:
+        // док стоит поверх игры уже сейчас, а core.txt мог ещё не успеть сказать. Вернуться док ждёт слова core.txt —
+        // или окна впереди на другом мониторе.
+        public static bool GameAway(bool coreOnline, bool coreGame, bool local, long sinceSwitch, bool dockScreen)
+        {
+            if (!dockScreen) return false;
+            if (!coreOnline) return local;
+            return coreGame || (local && sinceSwitch >= 0 && sinceSwitch < GameGraceMs);
+        }
+
+        // Счётчик непрочитанного появился: выскакивает, только пока не включено «Не беспокоить». Сам счётчик есть всегда.
+        public static bool BadgePops(bool appeared, bool focus) { return appeared && !focus; }
     }
 
     // Увеличение под курсором. Все координаты — в «покое»: 0 — левый край первого значка, когда ничего не увеличено.
@@ -419,13 +460,20 @@ namespace DevTxt.DockApp
         public int Size = 48;
         // Виджеты и счётчики: ключ настройки → включено. Порядок — тот, в котором они идут на странице настроек.
         public static readonly string[] WidgetKeys = { "widgetMusic", "widgetCalendar", "widgetWeather", "widgetVolume", "widgetBattery", "widgetClock", "badges" };
+        // Музыку, календарь и погоду уже показывает остров kapsula.txt наверху экрана: в доке они по умолчанию выключены
+        public static readonly string[] IslandKeys = { "widgetMusic", "widgetCalendar", "widgetWeather" };
+        // Отметка в state.json: у тех, кто пользовался доком раньше, эти три виджета уже один раз выключены
+        public const string IslandMark = "islandWidgets";
         public readonly Dictionary<string, bool> Flags = new Dictionary<string, bool>();
+        public bool IslandMigrated;   // этот Load выключил музыку, календарь и погоду (файл был от прежней версии)
 
         public Store(string dir)
         {
             Dir = dir;
-            foreach (string k in WidgetKeys) Flags[k] = true;
+            foreach (string k in WidgetKeys) Flags[k] = DefaultOn(k);
         }
+
+        public static bool DefaultOn(string key) { return Array.IndexOf(IslandKeys, key) < 0; }
 
         public bool On(string key) { bool v; return Flags.TryGetValue(key, out v) && v; }
 
@@ -466,9 +514,17 @@ namespace DevTxt.DockApp
                 string bar = Str(s, "bar");
                 Bar = Array.IndexOf(Bars, bar) >= 0 ? bar : Flag(s, "replaceTaskbar", false) ? "dock" : "both";   // прежняя настройка — переключатель
                 WinKey = Flag(s, "winKey", WinKey);
-                foreach (string k in WidgetKeys) Flags[k] = Flag(s, k, true);
+                foreach (string k in WidgetKeys) Flags[k] = Flag(s, k, DefaultOn(k));
+                if (!Flag(s, IslandMark, false))
+                {
+                    // Файл прежней версии: там эти виджеты были включены сами собой. Выключаем один раз — то же
+                    // показывает остров kapsula.txt. Кто включит их снова, у того они так и останутся.
+                    foreach (string k in IslandKeys) Flags[k] = false;
+                    IslandMigrated = true;
+                }
                 object size;
                 if (s != null && s.TryGetValue("size", out size) && size != null) try { Size = Clamp(Convert.ToDouble(size, System.Globalization.CultureInfo.InvariantCulture)); } catch { }
+                if (IslandMigrated) Save();   // отметка ложится в файл сразу: второй раз не выключаем
                 return true;
             }
             catch { return false; }
@@ -491,6 +547,7 @@ namespace DevTxt.DockApp
                 }
                 var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "bar", Bar, "winKey", WinKey);
                 foreach (string k in WidgetKeys) set[k] = Flags[k];
+                set[IslandMark] = true;
                 var d = HubLink.Msg("pins", pins.ToArray(), "settings", set);
                 Directory.CreateDirectory(Dir);
                 // Сначала рядом, потом на место: оборванная запись не оставит пустой файл
@@ -540,17 +597,19 @@ namespace DevTxt.DockApp
             };
             var items = new object[]
             {
-                HubLink.Msg("key", "autoHide", "type", "switch", "label", "Автоскрытие", "hint", "Док уезжает за нижний край экрана и возвращается, когда курсор касается этого края", "value", AutoHide),
+                // «дока» — чтобы не спутать с автоскрытием острова kapsula.txt; в меню дока и в трее под его именем — просто «Автоскрытие»
+                HubLink.Msg("key", "autoHide", "type", "switch", "label", "Автоскрытие дока", "hint", "Док уезжает за нижний край экрана и возвращается, когда курсор касается этого края", "value", AutoHide),
                 HubLink.Msg("key", "magnify", "type", "switch", "label", "Увеличение под курсором", "hint", "Значки рядом с курсором плавно растут, как в macOS", "value", Magnify),
                 HubLink.Msg("key", "showRunning", "type", "switch", "label", "Показывать запущенные", "hint", "После закреплённых приложений идут те, у которых сейчас открыто окно", "value", ShowRunning),
                 HubLink.Msg("key", "size", "type", "slider", "label", "Размер значков", "value", Size, "min", MinSize, "max", MaxSize, "step", 2, "unit", "px")
             };
             string[] labels = { "Музыка", "Календарь", "Погода", "Громкость", "Батарея", "Часы", "Счётчики непрочитанного" };
+            // Музыка, календарь и погода — то же, что на острове kapsula.txt: в доке они нужны, только если остров спрятан
             string[] hints =
             {
-                "Что играет, по данным kapsula.txt; под курсором — кнопки «назад», «пауза», «вперёд»",
-                "Ближайшее событие на сегодня, по данным kapsula.txt",
-                "Температура и погода, по данным kapsula.txt",
+                "Что играет, по данным kapsula.txt; под курсором — кнопки «назад», «пауза», «вперёд». То же показывает остров kapsula.txt — включите, если остров спрятан",
+                "Ближайшее событие на сегодня, по данным kapsula.txt. То же показывает остров kapsula.txt — включите, если остров спрятан",
+                "Температура и погода, по данным kapsula.txt. То же показывает остров kapsula.txt — включите, если остров спрятан",
                 "Колесо мыши меняет громкость, щелчок открывает быстрые настройки Windows, средняя кнопка выключает звук",
                 "Заряд — только если у компьютера есть батарея",
                 "Время; под курсором — дата, щелчок открывает уведомления и календарь Windows",

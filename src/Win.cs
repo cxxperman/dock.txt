@@ -18,8 +18,6 @@ namespace DevTxt.DockApp
     {
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int X, Y; }
-        [StructLayout(LayoutKind.Sequential)]
-        public struct RECT { public int Left, Top, Right, Bottom; }
         delegate bool EnumProc(IntPtr hwnd, IntPtr l);
 
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
@@ -38,15 +36,16 @@ namespace DevTxt.DockApp
         [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hwnd, int cmd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
-        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
-        [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
         [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder name, ref int size);
         [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT p, uint flags);
 
-        const int GWL_STYLE = -16, GWL_EXSTYLE = -20;
-        const long WS_CAPTION = 0x00C00000, WS_EX_TOOLWINDOW = 0x80, WS_EX_APPWINDOW = 0x40000, WS_EX_NOACTIVATE = 0x08000000;
+        const int GWL_EXSTYLE = -20;
+        const uint MONITOR_DEFAULTTOPRIMARY = 1, MONITOR_DEFAULTTONEAREST = 2;
+        const long WS_EX_TOOLWINDOW = 0x80, WS_EX_APPWINDOW = 0x40000, WS_EX_NOACTIVATE = 0x08000000;
         const uint GW_OWNER = 4, WM_SYSCOMMAND = 0x0112;
         const int SC_CLOSE = 0xF060, SW_MINIMIZE = 6, SW_RESTORE = 9, DWMWA_CLOAKED = 14;
 
@@ -69,6 +68,19 @@ namespace DevTxt.DockApp
         }
 
         public static IntPtr Foreground() { return GetForegroundWindow(); }
+
+        // Окно на главном мониторе — там, где стоит док (точка 0,0 всегда на главном). Окна нет или монитор не узнать —
+        // считаем, что на главном: тогда решает одно правило игры на весь экран, как и раньше.
+        public static bool OnDockScreen(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return true;
+            try
+            {
+                IntPtr mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                return mon == IntPtr.Zero || mon == MonitorFromPoint(new POINT(), MONITOR_DEFAULTTOPRIMARY);
+            }
+            catch { return true; }
+        }
 
         public static bool Minimized(IntPtr hwnd) { try { return IsIconic(hwnd); } catch { return false; } }
 
@@ -209,22 +221,6 @@ namespace DevTxt.DockApp
             }, IntPtr.Zero);
             known = next;
             return list;
-        }
-
-        // Впереди окно на весь экран (игра, видео)? Рабочий стол и панель задач не в счёт.
-        public static bool FullscreenAhead()
-        {
-            IntPtr fg = GetForegroundWindow();
-            if (fg == IntPtr.Zero) return false;
-            uint pid;
-            GetWindowThreadProcessId(fg, out pid);
-            if (pid == self) return false;
-            string cls = Class(fg);
-            if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "XamlExplorerHostIslandWindow") return false;
-            RECT r;
-            if (!GetWindowRect(fg, out r)) return false;
-            bool caption = (GetWindowLongPtr(fg, GWL_STYLE).ToInt64() & WS_CAPTION) == WS_CAPTION;
-            return Logic.IsFullscreen(r.Left, r.Top, r.Right, r.Bottom, GetSystemMetrics(0), GetSystemMetrics(1), caption);
         }
 
         public static void Activate(IntPtr hwnd)
