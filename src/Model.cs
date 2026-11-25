@@ -442,6 +442,40 @@ namespace DevTxt.DockApp
         }
     }
 
+    // Запуск вместе с Windows: значение «Dock» в HKCU\…\Run, как у kapsula.txt. Путь — в кавычках: по имени файла в нём
+    // core.txt находит запись и переносит её, когда программа переезжает. Пока Live выключен (--demo, --selftest, --shot,
+    // --headless), реестр не трогается совсем: переключатель живёт только в памяти.
+    static class Autostart
+    {
+        public const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", Name = "Dock";
+        public static bool Live;
+        static bool memory;
+
+        public static string Command(string exe) { return "\"" + exe + "\""; }
+
+        public static bool IsOn()
+        {
+            if (!Live) return memory;
+            try { using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(Name) != null; }
+            catch { return false; }
+        }
+
+        public static void Set(bool on)
+        {
+            if (!Live) { memory = on; return; }
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
+                {
+                    if (k == null) return;
+                    if (on) k.SetValue(Name, Command(System.Reflection.Assembly.GetExecutingAssembly().Location));
+                    else k.DeleteValue(Name, false);
+                }
+            }
+            catch { }
+        }
+    }
+
     // Закреплённые приложения и настройки: %APPDATA%\dev.txt\dock\state.json
     class Store
     {
@@ -601,7 +635,9 @@ namespace DevTxt.DockApp
                 HubLink.Msg("key", "autoHide", "type", "switch", "label", "Автоскрытие дока", "hint", "Док уезжает за нижний край экрана и возвращается, когда курсор касается этого края", "value", AutoHide),
                 HubLink.Msg("key", "magnify", "type", "switch", "label", "Увеличение под курсором", "hint", "Значки рядом с курсором плавно растут, как в macOS", "value", Magnify),
                 HubLink.Msg("key", "showRunning", "type", "switch", "label", "Показывать запущенные", "hint", "После закреплённых приложений идут те, у которых сейчас открыто окно", "value", ShowRunning),
-                HubLink.Msg("key", "size", "type", "slider", "label", "Размер значков", "value", Size, "min", MinSize, "max", MaxSize, "step", 2, "unit", "px")
+                HubLink.Msg("key", "size", "type", "slider", "label", "Размер значков", "value", Size, "min", MinSize, "max", MaxSize, "step", 2, "unit", "px"),
+                // section — core.txt показывает пункт на общей странице «Общие» → «Запуск и обновления», рядом с остальными приложениями
+                HubLink.Msg("key", "autostart", "type", "switch", "label", "Запускать вместе с Windows", "hint", "Док появляется сам, как только вы вошли в Windows", "value", Autostart.IsOn(), "section", "startup")
             };
             string[] labels = { "Музыка", "Календарь", "Погода", "Громкость", "Батарея", "Часы", "Счётчики непрочитанного" };
             // Музыка, календарь и погода — то же, что на острове kapsula.txt: в доке они нужны, только если остров спрятан
@@ -636,6 +672,13 @@ namespace DevTxt.DockApp
                 string v = value as string;
                 if (Array.IndexOf(Bars, v) < 0) throw new Exception("нужно одно из: dock, modern, both");
                 Bar = v;
+            }
+            else if (key == "autostart")
+            {
+                // Хранит сама Windows (раздел Run), а не state.json
+                if (!(value is bool)) throw new Exception("нужно «да» или «нет»");
+                Autostart.Set((bool)value);
+                return;
             }
             else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
             {

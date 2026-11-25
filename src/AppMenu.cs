@@ -136,25 +136,51 @@ namespace DevTxt.DockApp
             foreach (string n in names) list.Add(new AppEntry { Name = n, Target = @"C:\demo\" + n + ".exe", Link = @"C:\demo\" + n + ".lnk" });
             return AppRules.Clean(list);
         }
+
+        // Выдуманные закреплённые — те же, что в выдуманном доке (--demo)
+        public static List<AppEntry> DemoPinned()
+        {
+            var list = new List<AppEntry>();
+            foreach (string n in DockWindow.DemoPins) list.Add(new AppEntry { Name = n, Target = @"C:\demo\" + n + ".exe" });
+            return list;
+        }
+
+        // Раздел «Закреплённые»: закреплённые значки дока в том же порядке. icons — брать настоящие значки программ.
+        public static List<AppEntry> FromDock(List<DockItem> items, bool icons)
+        {
+            var list = new List<AppEntry>();
+            if (items == null) return list;
+            foreach (DockItem i in items)
+            {
+                if (!i.Pinned) continue;
+                list.Add(new AppEntry { Name = i.Name, Target = i.Path, Link = i.Link, App = i.App, Args = i.Pin != null ? i.Pin.Args : null, Pinned = i, Image = icons ? Shell.IconOf(i) : null });
+            }
+            return list;
+        }
     }
 
     // Содержимое меню приложений. Отдельно от окна — чтобы его можно было нарисовать в файл, не показывая (--apps --shot).
     // Ячейки значков делаются один раз: поиск только переставляет их и прячет лишние, а не собирает сетку заново.
+    // Пока поиск пуст, сверху — «Закреплённые» (как в доке), под ними — «Все приложения»; стрелки ходят по обоим разделам
+    // как по одному списку. При наборе — только найденное, без разделов.
     class AppMenuView
     {
-        const double CellW = 124, CellH = 122, IconSize = 60, FieldW = 440, FieldH = 46, Dim = 0.82, Glow = 0.5, PowerH = 34;
-        const int ConfirmSeconds = 4;
+        const double CellW = 148, CellH = 128, IconSize = 64, FieldW = 440, FieldH = 46, Dim = 0.82, Glow = 0.5, PowerH = 34, HeadH = 34, SectionGap = 14;
+        const int ConfirmSeconds = 4, MaxColumns = 7;
         public readonly Grid Root;
         public readonly TextBox Box;
         public Action<AppEntry> Launch;
         public Action Dismiss;
         public Action<string> OnSession;   // выключение, перезагрузка, сон, блокировка; null — кнопки ничего не делают (снимок, --demo)
-        readonly TextBlock placeholder, note;
+        readonly TextBlock placeholder, note, pinHead, allHead;
         readonly Canvas grid = new Canvas { VerticalAlignment = VerticalAlignment.Top };
         readonly ScrollViewer scroll;
         readonly Dictionary<string, Cell> made = new Dictionary<string, Cell>(StringComparer.OrdinalIgnoreCase);
-        readonly List<Cell> cells = new List<Cell>();   // то, что сейчас показано, по порядку
+        readonly List<Cell> cells = new List<Cell>();   // то, что сейчас показано, по порядку: сначала закреплённые
+        readonly List<UIElement> order = new List<UIElement>();   // заголовки и ячейки сверху вниз — для волны появления
         readonly int columns;
+        readonly List<AppEntry> pinned;
+        int[] sections = new int[0];   // сколько значков в каждом показанном разделе
         List<AppEntry> all;
         Cell marked;
         int selected = -1;
@@ -168,10 +194,13 @@ namespace DevTxt.DockApp
         }
 
         // desktop — подложить под затемнение тёмный фон со свечением: для снимка, где за окном ничего нет
-        public AppMenuView(double w, double h, List<AppEntry> apps, bool desktop)
+        // pinned — закреплённые в доке, по порядку (может быть пустым)
+        public AppMenuView(double w, double h, List<AppEntry> apps, List<AppEntry> pinned, bool desktop)
         {
             all = apps;
-            columns = (int)Math.Max(3, Math.Min(9, Math.Floor((w - 160) / CellW)));
+            this.pinned = pinned ?? new List<AppEntry>();
+            // Не шире семи колонок: на широком экране сетка не расползается и не выглядит редкой
+            columns = (int)Math.Max(3, Math.Min(MaxColumns, Math.Floor((w - 160) / CellW)));
             Root = new Grid { Width = w, Height = h, Background = Brushes.Transparent, ClipToBounds = true };
             if (desktop)
             {
@@ -217,6 +246,11 @@ namespace DevTxt.DockApp
             note.Margin = new Thickness(0, 60, 0, 0);
             note.IsHitTestVisible = false;
 
+            // Подписи разделов — мелким вторичным текстом, как подписи групп в остальных приложениях семьи
+            pinHead = Head("Закреплённые");
+            allHead = Head("Все приложения");
+            grid.Children.Add(pinHead);
+            grid.Children.Add(allHead);
             grid.Width = columns * CellW;
             grid.HorizontalAlignment = HorizontalAlignment.Center;
             // Полоса прокрутки — тонкая, из общих стилей kit.txt (Ui.Styles), и только когда есть что листать
@@ -243,6 +277,7 @@ namespace DevTxt.DockApp
             // Ячейки программ, которых больше нет, убираются; остальные остаются теми же
             var alive = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
             if (apps != null) foreach (AppEntry e in apps) alive[KeyOf(e)] = true;
+            foreach (AppEntry e in pinned) alive[PinKey + KeyOf(e)] = true;
             foreach (string key in new List<string>(made.Keys))
             {
                 if (alive.ContainsKey(key)) continue;
@@ -252,7 +287,17 @@ namespace DevTxt.DockApp
             Fill();
         }
 
-        static string KeyOf(AppEntry e) { return (e.Link ?? "") + "|" + (e.Target ?? "") + "|" + (e.Args ?? ""); }
+        static string KeyOf(AppEntry e) { return (e.Link ?? "") + "|" + (e.Target ?? "") + "|" + (e.Args ?? "") + "|" + (e.App ?? ""); }
+        // Закреплённое есть и среди всех приложений: у него в разделе «Закреплённые» своя ячейка
+        const string PinKey = "pin|";
+
+        static TextBlock Head(string text)
+        {
+            TextBlock t = Ui.T(text, Tokens.Size.Caption, Ui.Label2, FontWeights.SemiBold);
+            t.IsHitTestVisible = false;
+            t.Visibility = Visibility.Collapsed;
+            return t;
+        }
 
         static int TintOf(string name)
         {
@@ -262,9 +307,9 @@ namespace DevTxt.DockApp
         }
 
         // Ячейка программы: та же, что в прошлый раз, или новая
-        Cell CellFor(AppEntry entry)
+        Cell CellFor(AppEntry entry, bool pin)
         {
-            string key = KeyOf(entry);
+            string key = (pin ? PinKey : "") + KeyOf(entry);
             Cell cell;
             if (made.TryGetValue(key, out cell))
             {
@@ -318,24 +363,52 @@ namespace DevTxt.DockApp
             string query = Box.Text;
             placeholder.Visibility = query.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
             List<AppEntry> list = AppRules.Filter(all, query);
+            // Разделы — только пока ничего не набрано и список уже собран
+            bool split = query.Length == 0 && all != null && pinned.Count > 0;
             Select(-1, false);
             foreach (Cell c in made.Values) c.Index = -1;
             cells.Clear();
-            for (int i = 0; i < list.Count; i++)
+            order.Clear();
+            double y = 0;
+            if (split)
             {
-                Cell c = CellFor(list[i]);
-                c.Index = i;
-                cells.Add(c);
-                Canvas.SetLeft(c.Root, (i % columns) * CellW);
-                Canvas.SetTop(c.Root, (i / columns) * CellH);
-                if (c.Root.Visibility != Visibility.Visible) c.Root.Visibility = Visibility.Visible;
+                y = Lay(Heading(pinHead, y), pinned, true);
+                y = Heading(allHead, y + SectionGap);
             }
+            pinHead.Visibility = allHead.Visibility = split ? Visibility.Visible : Visibility.Collapsed;
+            y = Lay(y, list, false);
+            sections = split ? new int[] { pinned.Count, list.Count } : new int[] { list.Count };
             foreach (Cell c in made.Values)
                 if (c.Index < 0 && c.Root.Visibility != Visibility.Collapsed) c.Root.Visibility = Visibility.Collapsed;
-            grid.Height = Math.Ceiling(list.Count / (double)columns) * CellH;
+            grid.Height = y;
             note.Text = all == null ? "Собираю список приложений…" : list.Count == 0 ? "Ничего не найдено" : "";
-            Select(list.Count > 0 ? 0 : -1, false);   // Enter открывает первое найденное
+            Select(cells.Count > 0 ? 0 : -1, false);   // Enter открывает первое: закреплённое или найденное
             scroll.ScrollToTop();
+        }
+
+        // Подпись раздела на высоте y; возвращает, где начинаются его значки
+        double Heading(TextBlock head, double y)
+        {
+            Canvas.SetLeft(head, 12);
+            Canvas.SetTop(head, y + 10);
+            order.Add(head);
+            return y + HeadH;
+        }
+
+        // Ячейки раздела рядами от высоты y; возвращает, где раздел кончается
+        double Lay(double y, List<AppEntry> list, bool pin)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                Cell c = CellFor(list[i], pin);
+                c.Index = cells.Count;
+                cells.Add(c);
+                order.Add(c.Root);
+                Canvas.SetLeft(c.Root, (i % columns) * CellW);
+                Canvas.SetTop(c.Root, y + (i / columns) * CellH);
+                if (c.Root.Visibility != Visibility.Visible) c.Root.Visibility = Visibility.Visible;
+            }
+            return y + Math.Ceiling(list.Count / (double)columns) * CellH;
         }
 
         // reveal — прокрутить список так, чтобы выбранное было видно (для клавиш; под курсором оно и так на виду)
@@ -350,13 +423,13 @@ namespace DevTxt.DockApp
             if (reveal) marked.Root.BringIntoView();
         }
 
-        public void Move(int dx, int dy) { Select(AppRules.Move(selected, cells.Count, columns, dx, dy), true); }
+        public void Move(int dx, int dy) { Select(AppRules.Move(selected, sections, columns, dx, dy), true); }
 
         // Home, End, PageUp, PageDown
         public void Jump(string jump)
         {
             double view = scroll.ViewportHeight > 0 ? scroll.ViewportHeight : scroll.ActualHeight;
-            Select(AppRules.Jump(selected, cells.Count, columns, (int)Math.Max(1, Math.Floor(view / CellH)), jump), true);
+            Select(AppRules.Jump(selected, sections, columns, (int)Math.Max(1, Math.Floor(view / CellH)), jump), true);
         }
 
         public void LaunchSelected()
@@ -427,14 +500,20 @@ namespace DevTxt.DockApp
         public void Enter()
         {
             if (!Ui.ReducedMotion) Root.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(Tokens.Motion.FastMs)) { EasingFunction = Ui.EaseOut });
+            // Волна идёт в порядке детей сетки: ставим их так, как они стоят на экране, — сверху вниз, первым закреплённое
+            var rest = new List<UIElement>();
+            foreach (UIElement e in grid.Children) if (!order.Contains(e)) rest.Add(e);
+            grid.Children.Clear();
+            foreach (UIElement e in order) grid.Children.Add(e);
+            foreach (UIElement e in rest) grid.Children.Add(e);
             Motion.Stagger(grid);
         }
 
         // Рисует меню в файл PNG, не показывая его на экране
-        public static void Shot(string file, List<AppEntry> apps, string query)
+        public static void Shot(string file, List<AppEntry> apps, List<AppEntry> pinned, string query)
         {
             const double w = 1280, h = 800;
-            var view = new AppMenuView(w, h, apps, true);
+            var view = new AppMenuView(w, h, apps, pinned, true);
             System.Windows.Documents.TextElement.SetFontFamily(view.Root, Ui.TextFont);
             if (!string.IsNullOrEmpty(query)) view.Box.Text = query;
             Program.Save(view.Root, w, h, 1.5, file);
@@ -448,7 +527,8 @@ namespace DevTxt.DockApp
         readonly AppMenuView view;
         bool closing;
 
-        public AppMenuWindow(bool demo)
+        // pinned — закреплённые в доке, в его порядке: раздел «Закреплённые» сверху
+        public AppMenuWindow(bool demo, List<AppEntry> pinned)
         {
             Title = "dock.txt";
             WindowStyle = WindowStyle.None;
@@ -464,13 +544,14 @@ namespace DevTxt.DockApp
             UseLayoutRounding = true;
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
 
-            view = new AppMenuView(Width, Height, demo ? AppCatalog.Demo() : AppCatalog.Cached, false);
+            view = new AppMenuView(Width, Height, demo ? AppCatalog.Demo() : AppCatalog.Cached, pinned, false);
             view.Dismiss = Shut;
             view.Launch = delegate(AppEntry e)
             {
                 Shut();
                 if (demo) return;
-                try { if (e.App != null) Packaged.Open(e.App); else Shell.Open(e.Link); } catch { }
+                // Закреплённое запускается так же, как щелчком в доке: через свой ярлык или файл с параметрами
+                try { if (e.Pinned != null) Shell.Launch(e.Pinned); else if (e.App != null) Packaged.Open(e.App); else Shell.Open(e.Link); } catch { }
             };
             // Питание — только в настоящем доке; в --demo кнопки нарисованы, но ничего не делают
             if (!demo) view.OnSession = delegate(string kind) { Shut(); Session.Run(kind); };

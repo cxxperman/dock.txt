@@ -153,6 +153,32 @@ namespace DevTxt.DockApp
             return b;
         }
 
+        // Кнопка меню приложений: плитка той же формы и величины, что значки (как LetterTile), из светлого стекла —
+        // рядом с цветными значками она не спорит с ними, — и на ней сетка 3×3 скруглённых точек: «все приложения»
+        public static FrameworkElement AppsTile(double size)
+        {
+            var glass = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(0, 1) };
+            glass.GradientStops.Add(new GradientStop(Ui.Alpha(Colors.White, 0.24), 0));
+            glass.GradientStops.Add(new GradientStop(Ui.Alpha(Colors.White, 0.13), 1));
+            glass.Freeze();
+            const double dot = 3.7, pitch = 5.9, from = (Field - 2 * pitch - dot) / 2;
+            var dots = new UIElement[9];
+            for (int i = 0; i < 9; i++)
+            {
+                var d = new Rectangle { Width = dot, Height = dot, RadiusX = 1.3, RadiusY = 1.3, Fill = Ui.Label };
+                Canvas.SetLeft(d, from + (i % 3) * pitch);
+                Canvas.SetTop(d, from + (i / 3) * pitch);
+                dots[i] = d;
+            }
+            FrameworkElement grid = Box(Field, Field, size * 0.56, dots);
+            grid.HorizontalAlignment = HorizontalAlignment.Center;
+            return new Border
+            {
+                Width = size * 0.92, Height = size * 0.92, CornerRadius = new CornerRadius(size * 0.23), Background = glass,
+                BorderBrush = Ui.Solid(Ui.Alpha(Colors.White, 0.2)), BorderThickness = new Thickness(1), Child = grid, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+
         // Цветная плитка с первой буквой — когда у программы нет значка, как в core.txt
         public static FrameworkElement LetterTile(string name, double size, int index)
         {

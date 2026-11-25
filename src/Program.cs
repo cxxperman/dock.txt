@@ -48,6 +48,8 @@ namespace DevTxt.DockApp
             if (Arg(args, "--seconds") != null) int.TryParse(Arg(args, "--seconds"), out seconds);
             if (Array.IndexOf(args, "--selftest") >= 0) return SelfTest.Run();
             DockHub.TestHook = Array.IndexOf(args, "--testhook") >= 0;
+            // Запуск вместе с Windows пишется в реестр только настоящим доком; в снимках и проверках — только в памяти
+            Autostart.Live = !demo && !headless && shot == null;
 
             bool created = true;
             Mutex mutex = null;
@@ -60,8 +62,17 @@ namespace DevTxt.DockApp
             Session.Armed = !demo && !headless && !probe && shot == null;
             if (shot != null && Array.IndexOf(args, "--apps") >= 0)
             {
-                // Меню приложений: выдуманный список или настоящий, собранный прямо сейчас
-                AppMenuView.Shot(shot, demo ? AppCatalog.Demo() : AppCatalog.Scan(), Arg(args, "--query"));
+                // Меню приложений: выдуманный список или настоящий, собранный прямо сейчас; закреплённые — выдуманные
+                // или те, что в state.json (файл только читается)
+                List<AppEntry> pinned;
+                if (demo) pinned = AppCatalog.DemoPinned();
+                else
+                {
+                    var saved = new Store(stateDir ?? Store.DefaultDir);
+                    saved.Load();
+                    pinned = AppCatalog.FromDock(Logic.Group(saved.Pins, new List<WinInfo>(), false, Shell.NameOf), true);
+                }
+                AppMenuView.Shot(shot, demo ? AppCatalog.Demo() : AppCatalog.Scan(), pinned, Arg(args, "--query"));
                 return 0;
             }
             var store = new Store(demo ? null : stateDir ?? Store.DefaultDir);
@@ -396,7 +407,7 @@ namespace DevTxt.DockApp
             var d = s.Describe();
             var groups = d["groups"] as object[];
             var list = groups != null && groups.Length == 3 ? ((Dictionary<string, object>)groups[0])["items"] as object[] : null;
-            Check(list != null && list.Length == 4, "the first group has four settings");
+            Check(list != null && list.Length == 5, "the first group has five settings");
             var tgroup = groups != null && groups.Length == 3 ? (Dictionary<string, object>)groups[1] : null;
             var tlist = tgroup != null ? tgroup["items"] as object[] : null;
             Check(tgroup != null && (string)tgroup["title"] == "Панель задач" && tlist != null && tlist.Length == 2
@@ -422,13 +433,15 @@ namespace DevTxt.DockApp
                 Check(offByDefault == "widgetMusic widgetCalendar widgetWeather " && islandHints == offByDefault, "music, calendar and weather are off by default and their hints say the island kapsula.txt shows the same; volume, battery, clock and badges stay on, got " + offByDefault + "/ " + islandHints);
                 Check(fromKapsula == "widgetMusic widgetCalendar widgetWeather badges ", "the hints still say these widgets need data from kapsula.txt (without it they stay empty), got " + fromKapsula);
             }
-            if (list != null && list.Length == 4)
+            if (list != null && list.Length == 5)
             {
                 string keys = "", types = "";
                 foreach (Dictionary<string, object> it in list) { keys += it["key"] + " "; types += it["type"] + " "; Check(it.ContainsKey("label") && it.ContainsKey("value"), "every setting has a label and a value"); }
-                Check(keys == "autoHide magnify showRunning size " && types == "switch switch switch slider ", "three switches and the size slider, got " + keys + "/ " + types);
+                Check(keys == "autoHide magnify showRunning size autostart " && types == "switch switch switch slider switch ", "three switches, the size slider and autostart, got " + keys + "/ " + types);
                 var size = (Dictionary<string, object>)list[3];
                 Check((int)size["min"] == 36 && (int)size["max"] == 72 && (int)size["value"] == 48, "icon size runs from 36 to 72 and starts at 48");
+                var auto = (Dictionary<string, object>)list[4];
+                Check((string)auto["label"] == "Запускать вместе с Windows" && (string)auto["section"] == "startup" && !(bool)auto["value"], "«Запускать вместе с Windows» goes to «Общие» → «Запуск и обновления» in core.txt and is off by default");
             }
             string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(d);
             Check(json.StartsWith("{\"groups\":[{\"title\":\"\",\"items\":[{\"key\":\"autoHide\",\"type\":\"switch\""), "the description serialises the way the protocol shows it");
@@ -455,16 +468,35 @@ namespace DevTxt.DockApp
             Check(refused && s.On("widgetClock"), "a widget switch does not take a number");
             var after = (object[])((Dictionary<string, object>)((object[])s.Describe()["groups"])[2])["items"];
             Check((bool)((Dictionary<string, object>)after[0])["value"] && !(bool)((Dictionary<string, object>)after[2])["value"] && !(bool)((Dictionary<string, object>)after[3])["value"] && !(bool)((Dictionary<string, object>)after[6])["value"] && (bool)((Dictionary<string, object>)after[5])["value"], "the description shows the new widget values");
-            bool anySection = false;
+            string sections = "";
             foreach (object g in (object[])s.Describe()["groups"])
-                foreach (Dictionary<string, object> it in (object[])((Dictionary<string, object>)g)["items"]) if (it.ContainsKey("section")) anySection = true;
-            Check(!anySection, "no dock setting is about games or autostart, so none moves to a shared page of core.txt");
+                foreach (Dictionary<string, object> it in (object[])((Dictionary<string, object>)g)["items"]) if (it.ContainsKey("section")) sections += it["key"] + ":" + it["section"] + " ";
+            Check(sections == "autostart:startup ", "only autostart moves to a shared page of core.txt, got " + sections);
+            // ── Запуск вместе с Windows: в проверке реестр не трогается ──
+            Check(!Autostart.Live, "the self-test never writes the Windows registry");
+            Check(Autostart.Command(@"C:\Users\u\dev.txt\dock\Dock.exe") == "\"C:\\Users\\u\\dev.txt\\dock\\Dock.exe\"" && Autostart.Name == "Dock" && Autostart.RunKey == @"Software\Microsoft\Windows\CurrentVersion\Run",
+                "the Run entry is «Dock» with the full path in quotes — the form core.txt looks for when it moves the program");
+            s.Apply("autostart", true);
+            Check(Autostart.IsOn() && FirstItem(s, "autostart"), "settings.set autostart=true switches it on and the description shows it");
+            refused = false;
+            try { s.Apply("autostart", "yes"); } catch { refused = true; }
+            Check(refused && Autostart.IsOn(), "the autostart switch does not take text");
+            s.Apply("autostart", false);
+            Check(!Autostart.IsOn() && !FirstItem(s, "autostart"), "…and off again");
             More();
             var apps = DockHub.Apps(items);
             Check(apps.Length == 5 && (string)((Dictionary<string, object>)apps[0])["name"] == "Notes" && (bool)((Dictionary<string, object>)apps[0])["running"] && !(bool)((Dictionary<string, object>)apps[2])["running"], "dock.apps lists name, path and running");
 
             Console.WriteLine(failed == 0 ? "all passed" : failed + " failed");
             return failed == 0 ? 0 : 1;
+        }
+
+        // Значение переключателя из первой группы описания
+        static bool FirstItem(Store s, string key)
+        {
+            foreach (Dictionary<string, object> it in (object[])((Dictionary<string, object>)((object[])s.Describe()["groups"])[0])["items"])
+                if ((string)it["key"] == key) return it["value"] is bool && (bool)it["value"];
+            return false;
         }
 
         static object Parse(string json) { return new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(json); }
@@ -691,6 +723,25 @@ namespace DevTxt.DockApp
             Check(AppRules.Move(6, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 0, 1) == 9 && AppRules.Move(9, 10, 4, 1, 0) == 9 && AppRules.Move(-1, 10, 4, 0, 1) == 0 && AppRules.Move(0, 0, 4, 1, 0) == -1, "down from above a short last row lands on the last app");
             Check(AppCatalog.Demo().Count == 28, "the demo menu has 28 apps");
             Check(AppRules.Jump(5, 30, 4, 3, "home") == 0 && AppRules.Jump(5, 30, 4, 3, "end") == 29 && AppRules.Jump(-1, 30, 4, 3, "down") == 0 && AppRules.Jump(3, 0, 4, 3, "end") == -1, "Home and End go to the first and the last app");
+            // Два раздела — «Закреплённые» (6) и «Все приложения» (10) — в четыре колонки: ряды 4, 2 | 4, 4, 2
+            int[] two = { 6, 10 };
+            Check(AppRules.Move(5, two, 4, 1, 0) == 6 && AppRules.Move(6, two, 4, -1, 0) == 5 && AppRules.Move(15, two, 4, 1, 0) == 15, "left and right walk across the section border as one list");
+            Check(AppRules.Move(1, two, 4, 0, 1) == 5 && AppRules.Move(3, two, 4, 0, 1) == 5 && AppRules.Move(5, two, 4, 0, 1) == 7 && AppRules.Move(4, two, 4, 0, 1) == 6, "down from pinned keeps the column, a short row takes its last app, then into «Все приложения»");
+            Check(AppRules.Move(7, two, 4, 0, -1) == 5 && AppRules.Move(9, two, 4, 0, -1) == 5 && AppRules.Move(2, two, 4, 0, -1) == 2 && AppRules.Move(13, two, 4, 0, 1) == 15 && AppRules.Move(15, two, 4, 0, 1) == 15, "up back into pinned, and the edges stop");
+            Check(AppRules.Jump(1, two, 4, 2, "down") == 7 && AppRules.Jump(7, two, 4, 2, "up") == 1 && AppRules.Jump(3, two, 4, 2, "end") == 15 && AppRules.Jump(9, two, 4, 2, "home") == 0, "PageDown, PageUp, Home and End go across sections");
+            Check(AppRules.Move(-1, two, 4, 0, 1) == 0 && AppRules.Move(0, new int[] { 0, 0 }, 4, 1, 0) == -1 && AppRules.Jump(0, new int[0], 4, 2, "end") == -1, "nothing selected — the first pinned app; nothing shown — nothing to select");
+            bool same = true;
+            for (int i = -1; i < 10; i++) for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) if (dx * dy == 0 && AppRules.Move(i, new int[] { 10 }, 4, dx, dy) != AppRules.Move(i, 10, 4, dx, dy)) same = false;
+            Check(same, "with one section (a search) the arrows work exactly as before");
+            var dockItems = new List<DockItem>
+            {
+                new DockItem { Key = "a", Name = "Alpha", Path = @"C:\a.exe", Pinned = true },
+                new DockItem { Key = "r", Name = "Running", Path = @"C:\r.exe" },
+                new DockItem { Key = "b", Name = "Beta", Path = @"C:\b.exe", Pinned = true, Pin = new Pin { Name = "Beta", Path = @"C:\b.exe", Args = "--x" } }
+            };
+            List<AppEntry> pinnedApps = AppCatalog.FromDock(dockItems, false);
+            Check(pinnedApps.Count == 2 && pinnedApps[0].Name == "Alpha" && pinnedApps[1].Name == "Beta" && pinnedApps[1].Args == "--x" && pinnedApps[1].Pinned == dockItems[2], "«Закреплённые» in the apps menu are the dock's pins in the dock's order and launch the way the dock does");
+            Check(AppCatalog.DemoPinned().Count == DockWindow.DemoPins.Length, "the demo menu shows the demo dock's pins");
             Check(AppRules.Jump(5, 30, 4, 3, "down") == 17 && AppRules.Jump(17, 30, 4, 3, "up") == 5 && AppRules.Jump(5, 30, 4, 3, "up") == 1 && AppRules.Jump(22, 30, 4, 3, "down") == 29 && AppRules.Jump(27, 30, 4, 3, "down") == 29, "PageUp and PageDown move by a screen of rows, keep the column and stop at the ends");
 
             // ── Питание в меню приложений ──

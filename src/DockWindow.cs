@@ -74,6 +74,18 @@ namespace DevTxt.DockApp
         const double LiftScale = 1.12, LiftShadow = 0.5, DropSlack = 0.12;
         const int LiftMs = 140, SettleMs = 220, PartMs = 200;
 
+        // Стекло: системный акрил в подложке и полупрозрачный тёмный фон самой полосы поверх него — белые подписи
+        // читаются и на белых обоях, а сквозь полосу видно, что позади
+        const double PanelTint = 0.45;
+        const int WM_SETTINGCHANGE = 0x1A, WM_DISPLAYCHANGE = 0x7E, WM_DPICHANGED = 0x2E0;
+        static readonly Brush solidFill = Ui.Solid(Tokens.Dark.Bg), glassFill = Ui.Solid(Ui.Alpha(Tokens.Dark.Bg, PanelTint));
+        GlassBackdrop glass;   // null — размытия нет: Windows 10, снимок, без окна
+        bool glassOn;          // размытие сейчас включено («Эффекты прозрачности» Windows не выключены)
+        readonly Grid shadowBox;
+        readonly RectangleGeometry shadowOuter, shadowInner;
+        long glideUntil = -1;  // до какого времени полоса едет за край или обратно: подложка едет вместе с ней
+        bool gliding;
+
         readonly bool demo, headless;
         readonly Store store;
         readonly Canvas stage = new Canvas();
@@ -149,13 +161,23 @@ namespace DevTxt.DockApp
             UseLayoutRounding = false;   // значки двигаются плавно, а не по целым точкам
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
 
-            // Полоса: тёмная основа (за окном размытия нет — стекло должно читаться на любых обоях), на ней стекло с кромкой
+            // Полоса: настоящее стекло — под ней окно-подложка, за которым Windows размывает обои и окна (Glass.cs),
+            // а сама полоса — полупрозрачная тёмная тонировка с кромкой: значки и подписи читаются и на белых обоях.
+            // Где размытия нет (Windows 10, выключены «Эффекты прозрачности», снимки) — прежний ровный тёмный фон,
+            // тот же, что у острова kapsula.txt наверху.
             panel = new Border
             {
-                // Тот же чёрный, что у острова kapsula.txt наверху: верх и низ экрана — один набор, а не два разных
-                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Ui.Solid(Tokens.Dark.Bg), SnapsToDevicePixels = true, IsHitTestVisible = false,
-                Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 22, ShadowDepth = 5, Direction = 270, Opacity = 0.38, Color = Colors.Black },
+                CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = solidFill, SnapsToDevicePixels = true, IsHitTestVisible = false,
                 Child = new Border { CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = Brushes.Transparent, BorderBrush = Ui.Rim, BorderThickness = new Thickness(1) }
+            };
+            // Тень — отдельно и только снаружи: под полупрозрачной полосой она просвечивала бы внутрь. Внутренность
+            // вырезана по форме полосы (на точку меньше — у кромки тень плотная и прикрывает край размытия).
+            shadowInner = new RectangleGeometry(new Rect(), Tokens.Radius.Block, Tokens.Radius.Block);
+            shadowOuter = new RectangleGeometry();
+            shadowBox = new Grid
+            {
+                IsHitTestVisible = false, Clip = new CombinedGeometry(GeometryCombineMode.Exclude, shadowOuter, shadowInner),
+                Children = { new Border { CornerRadius = new CornerRadius(Tokens.Radius.Block), Background = solidFill, Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 22, ShadowDepth = 5, Direction = 270, Opacity = 0.38, Color = Colors.Black } } }
             };
             // Одна полоса на все щелчки: от верха выросших значков до нижнего края экрана. Столбец под значком — это тот же
             // значок, поэтому курсор, упёртый в край экрана, попадает в цель. Полоса почти прозрачная, но не совсем:
@@ -172,6 +194,7 @@ namespace DevTxt.DockApp
             // Снизу вверх: полоса, поле для щелчков, черты и виджеты, точки, значки, подпись
             Panel.SetZIndex(strip, 1);
             Panel.SetZIndex(tip, 9);
+            stage.Children.Add(shadowBox);
             stage.Children.Add(panel);
             stage.Children.Add(strip);
             stage.Children.Add(tip);
@@ -203,13 +226,31 @@ namespace DevTxt.DockApp
             {
                 IntPtr me = new WindowInteropHelper(this).Handle;
                 Win.MakeBar(me);
-                // Проводник перезапустился и снова показал свою панель задач — прячем её заново
+                // Окно появляется на экране — только у настоящего окна (не в снимке и не без окна): тогда и подложка
+                // для размытия. Она владелец окна дока, поэтому док всегда стоит прямо над ней.
+                if (GlassBackdrop.Supported)
+                {
+                    try
+                    {
+                        glass = new GlassBackdrop();
+                        new WindowInteropHelper(this).Owner = glass.Handle;
+                    }
+                    catch { glass = null; }
+                }
+                ApplyGlass();
                 HwndSource.FromHwnd(me).AddHook(delegate(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled)
                 {
+                    // Проводник перезапустился и снова показал свою панель задач — прячем её заново
                     if (msg == TaskbarSwap.TaskbarCreated && msg != 0) Dispatcher.BeginInvoke(new Action(SyncTaskbar));
+                    // Переключили «Эффекты прозрачности» (и другие общие настройки) — смотрим, нужно ли размытие
+                    else if (msg == WM_SETTINGCHANGE) Dispatcher.BeginInvoke(new Action(ApplyGlass));
+                    else if (msg == WM_DPICHANGED || msg == WM_DISPLAYCHANGE) Dispatcher.BeginInvoke(new Action(SyncGlass));
                     return IntPtr.Zero;
                 });
             };
+            // Окно дока спрятали (игра, панель Windows) или показали — подложка вместе с ним
+            IsVisibleChanged += delegate { SyncGlass(); };
+            Closed += delegate { if (glass != null) { glass.Dispose(); glass = null; } };
             // Окно показали, а дока сейчас быть не должно (игра на весь экран, выбрана панель Windows) — сразу убираем
             ContentRendered += delegate { if (away && !headless) Hide(); };
 
@@ -294,6 +335,7 @@ namespace DevTxt.DockApp
             previewOpen.Stop(); previewShut.Stop(); previewPoll.Stop();
             if (preview != null) { try { preview.Close(); } catch { } preview = null; }
             StopLoop();
+            if (glass != null) glass.Hide();
             Win.Unwatch();
             // Док уходит — панель задач и кнопка Windows возвращаются такими, какими были
             WinKey.Stop();
@@ -611,12 +653,11 @@ namespace DevTxt.DockApp
             slot.BadgeText = badge;
         }
 
-        // Кнопка меню приложений: пиксельный значок дока на стеклянной плитке из kit.txt
+        // Кнопка меню приложений: плитка той же формы, что значки, с сеткой из девяти точек — «все приложения»
         Slot LauncherSlot()
         {
             var slot = new Slot { Kind = SlotKind.Launcher, Id = "launcher", W = size, Built = size };
-            var tile = new Viewbox { Width = size * 0.92, Height = size * 0.92, Child = Ui.Tile(Ui.Sprite(DockSprite, 34)), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { tile } };
+            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { Glyphs.AppsTile(size) } };
             root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
             slot.Root = root;
             return slot;
@@ -966,7 +1007,7 @@ namespace DevTxt.DockApp
             Place(true);
             if (hover >= 0 && !menuOpen) { if (FillTip()) { tip.BeginAnimation(OpacityProperty, null); tip.Opacity = 1; } }
             // Полоса спрятана за краем, а её высота изменилась — прячем заново, на новую глубину
-            if ((hidden || away) && HiddenY != lastHiddenY) { slide.BeginAnimation(TranslateTransform.YProperty, null); slide.Y = HiddenY; }
+            if ((hidden || away) && HiddenY != lastHiddenY) { slide.BeginAnimation(TranslateTransform.YProperty, null); slide.Y = HiddenY; SyncGlass(); }
             lastHiddenY = HiddenY;
             if (animate) StartLoop();
             if (hub != null) hub.PublishWidgets(shown, Badges());
@@ -1061,6 +1102,7 @@ namespace DevTxt.DockApp
             panelLeft = origin + from - PadH; panelRight = origin + to + PadH;
             Canvas.SetLeft(panel, panelLeft);
             panel.Width = Math.Max(0, panelRight - panelLeft);
+            PlaceShadow();
             double rise = amount * size * (MaxScale - 1) + 2;
             Canvas.SetLeft(strip, panelLeft);
             Canvas.SetTop(strip, panelTop - rise);
@@ -1126,6 +1168,63 @@ namespace DevTxt.DockApp
                 s.DotMove.Y = baseline + (DotZone - DotSize) / 2 - 1;
             }
             PlaceTip();
+            SyncGlass();
+        }
+
+        // Тень полосы: на месте полосы, внутренность вырезана
+        void PlaceShadow()
+        {
+            double w = panel.Width, h = panel.Height;
+            if (double.IsNaN(h)) return;
+            Canvas.SetLeft(shadowBox, panelLeft);
+            Canvas.SetTop(shadowBox, panelTop);
+            shadowBox.Width = w; shadowBox.Height = h;
+            shadowOuter.Rect = new Rect(-60, -60, w + 120, h + 120);
+            shadowInner.Rect = new Rect(1, 1, Math.Max(0, w - 2), Math.Max(0, h - 2));
+        }
+
+        // ───────── Размытие за полосой ─────────
+        // Включить или выключить стекло: по «Эффектам прозрачности» Windows, на ходу
+        void ApplyGlass()
+        {
+            bool on = glass != null && !ended && GlassBackdrop.TransparencyOn();
+            if (on == glassOn && glass != null) { SyncGlass(); return; }
+            glassOn = on;
+            panel.Background = on ? glassFill : solidFill;
+            SyncGlass();
+        }
+
+        // Подложка встаёт ровно под полосу, в точках экрана. Зовётся там же, где полоса двигается (Place, проезд
+        // за край), поэтому в покое не делает ничего; одинаковое место второй раз Windows не передаётся (GlassBackdrop).
+        void SyncGlass()
+        {
+            if (glass == null) return;
+            PresentationSource src = glassOn && IsVisible && !ended ? PresentationSource.FromVisual(this) : null;
+            double pw = panel.Width, ph = panel.Height;
+            if (src == null || src.CompositionTarget == null || double.IsNaN(pw) || double.IsNaN(ph)) { glass.Hide(); return; }
+            Matrix m = src.CompositionTarget.TransformToDevice;
+            double top = panelTop + slide.Y, bottom = Math.Min(winH, top + ph);   // ниже окна дока полосы не видно — и подложки тоже
+            int x = (int)Math.Round((Left + panelLeft) * m.M11), y = (int)Math.Round((Top + top) * m.M22);
+            int h = (int)Math.Round((Top + bottom) * m.M22) - y;
+            glass.Place(x, y, (int)Math.Round(pw * m.M11), h);
+        }
+
+        // Полоса едет за край или обратно (анимация WPF): подложка следует за ней каждый кадр, пока проезд не кончится
+        void FollowGlide(int ms)
+        {
+            if (glass == null) return;
+            glideUntil = clock.ElapsedMilliseconds + ms + 60;
+            if (gliding) return;
+            gliding = true;
+            CompositionTarget.Rendering += GlideFrame;
+        }
+
+        void GlideFrame(object sender, EventArgs e)
+        {
+            SyncGlass();
+            if (clock.ElapsedMilliseconds < glideUntil && !ended) return;
+            gliding = false;
+            CompositionTarget.Rendering -= GlideFrame;
         }
 
         // Чей это столбец: место, над которым (или под которым, до самого края экрана) стоит точка x. −1 — ничей.
@@ -1338,12 +1437,15 @@ namespace DevTxt.DockApp
             {
                 slide.BeginAnimation(TranslateTransform.YProperty, null);
                 slide.Y = to;
+                SyncGlass();
                 if (away && !headless && !demo && IsVisible) Hide();
                 return;
             }
-            var a = new DoubleAnimation(to, TimeSpan.FromMilliseconds(down ? Tokens.Motion.BaseMs : Tokens.Motion.SlowMs)) { EasingFunction = down ? (IEasingFunction)new CubicEase { EasingMode = EasingMode.EaseIn } : Ui.EaseOut };
+            int ms = down ? Tokens.Motion.BaseMs : Tokens.Motion.SlowMs;
+            var a = new DoubleAnimation(to, TimeSpan.FromMilliseconds(ms)) { EasingFunction = down ? (IEasingFunction)new CubicEase { EasingMode = EasingMode.EaseIn } : Ui.EaseOut };
             if (away) a.Completed += delegate { if (away && !ended) Hide(); };
             slide.BeginAnimation(TranslateTransform.YProperty, a);
+            FollowGlide(ms);
         }
 
         // ───────── Щелчки ─────────
@@ -1754,7 +1856,7 @@ namespace DevTxt.DockApp
         void ToggleApps()
         {
             if (appMenu != null) { appMenu.Shut(); return; }
-            var menu = new AppMenuWindow(demo);
+            var menu = new AppMenuWindow(demo, demo ? AppCatalog.DemoPinned() : AppCatalog.FromDock(items, true));
             appMenu = menu;
             menu.Closed += delegate { if (appMenu == menu) appMenu = null; };
             ClosePreview(true);
@@ -1804,12 +1906,14 @@ namespace DevTxt.DockApp
                 else if (item.Windows.Count > 1) menu.Item("Закрыть все окна", false, delegate { if (!demo) foreach (IntPtr h in item.Windows.ToArray()) Win.Close(h); });
                 menu.Line();
             }
+            bool online = hub != null && hub.Online;
             menu.Brand(DockSprite, "dock");
             menu.Item("Автоскрытие", store.AutoHide, delegate { ToggleAutoHide(); });
+            // С core.txt этот переключатель — на его странице «Общие» → «Запуск и обновления»; без него — здесь
+            if (!online) menu.Item("Запускать вместе с Windows", Autostart.IsOn(), delegate { Autostart.Set(!Autostart.IsOn()); SettingsChanged(); });
             menu.Item("Вместо панели задач Windows", store.ReplaceTaskbar, delegate { store.Bar = store.ReplaceTaskbar ? "both" : "dock"; store.Save(); SettingsChanged(); });
             // Значки трея живут в панели задач Windows: показываем её ненадолго, сама спрячется, когда курсор уйдёт
             if (TaskbarSwap.Active) menu.Item("Значки в трее", false, delegate { TaskbarSwap.Peek(); });
-            bool online = hub != null && hub.Online;
             // Настройки дока живут в core.txt: открываем его на странице дока, а если его нет — предлагаем скачать
             menu.Item(online || CoreApp.Installed ? "Настройки" : "Скачать core.txt — настройки и остальные приложения", false,
                 delegate { if (!demo) OpenSettings(); });
@@ -1842,11 +1946,13 @@ namespace DevTxt.DockApp
         }
 
         // ───────── Для снимков и проверки ─────────
+        internal static readonly string[] DemoPins = { "Проводник", "Браузер", "Discord", "Steam", "Музыка", "Заметки" };
+
         // Выдуманные значки: ни окна, ни диск, ни хаб не трогаются. У «Браузера» три окна, и одно из них впереди.
         List<DockItem> Demo()
         {
             var list = new List<DockItem>();
-            string[] pinned = { "Проводник", "Браузер", "Discord", "Steam", "Музыка", "Заметки" };
+            string[] pinned = DemoPins;
             for (int i = 0; i < pinned.Length; i++)
             {
                 var it = new DockItem { Key = "demo-" + i, Name = pinned[i], Path = @"C:\demo\" + pinned[i] + ".exe", Pinned = true };

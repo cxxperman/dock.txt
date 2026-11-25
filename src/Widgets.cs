@@ -264,6 +264,7 @@ namespace DevTxt.DockApp
         public string Name, Target, Args, Link, Icon;
         public string App;
         public System.Windows.Media.ImageSource Image;
+        public DockItem Pinned;   // закреплённое в доке (раздел «Закреплённые»): запускается так же, как из дока
     }
 
     static class AppRules
@@ -415,6 +416,55 @@ namespace DevTxt.DockApp
             int col = index % columns, row = index / columns, last = (count - 1) / columns;
             row = jump == "up" ? Math.Max(0, row - rows) : Math.Min(last, row + rows);
             return Math.Min(count - 1, row * columns + col);
+        }
+
+        // Сетка из нескольких разделов («Закреплённые», «Все приложения»): каждый раздел начинается с новой строки.
+        // Для каждого ряда — номер его первого значка в общем списке и сколько в нём значков.
+        public static List<int[]> Rows(int[] sections, int columns)
+        {
+            var rows = new List<int[]>();
+            columns = Math.Max(1, columns);
+            int start = 0;
+            foreach (int n in sections)
+            {
+                for (int i = 0; i < n; i += columns) rows.Add(new int[] { start + i, Math.Min(columns, n - i) });
+                start += Math.Max(0, n);
+            }
+            return rows;
+        }
+
+        static int RowOf(List<int[]> rows, int index)
+        {
+            for (int r = 0; r < rows.Count; r++) if (index >= rows[r][0] && index < rows[r][0] + rows[r][1]) return r;
+            return -1;
+        }
+
+        // Стрелки по разделам как по одному списку: влево и вправо — по порядку, через границу раздела; вверх и вниз —
+        // в тот же столбец соседнего ряда, а если он короче — на его последний значок
+        public static int Move(int index, int[] sections, int columns, int dx, int dy)
+        {
+            List<int[]> rows = Rows(sections, columns);
+            int count = rows.Count == 0 ? 0 : rows[rows.Count - 1][0] + rows[rows.Count - 1][1];
+            if (count <= 0) return -1;
+            if (index < 0 || index >= count) return 0;
+            if (dy == 0) { int to = index + dx; return to < 0 || to >= count ? index : to; }
+            int r = RowOf(rows, index), next = r + dy;
+            if (next < 0 || next >= rows.Count) return index;
+            return rows[next][0] + Math.Min(index - rows[r][0], rows[next][1] - 1);
+        }
+
+        // Home, End, PageUp, PageDown по разделам; rows — сколько рядов помещается на экране
+        public static int Jump(int index, int[] sections, int columns, int rows, string jump)
+        {
+            List<int[]> list = Rows(sections, columns);
+            int count = list.Count == 0 ? 0 : list[list.Count - 1][0] + list[list.Count - 1][1];
+            if (count <= 0) return -1;
+            if (jump == "home") return 0;
+            if (jump == "end") return count - 1;
+            if (index < 0 || index >= count) return 0;
+            int r = RowOf(list, index), col = index - list[r][0];
+            int to = jump == "up" ? Math.Max(0, r - Math.Max(1, rows)) : Math.Min(list.Count - 1, r + Math.Max(1, rows));
+            return list[to][0] + Math.Min(col, list[to][1] - 1);
         }
     }
 

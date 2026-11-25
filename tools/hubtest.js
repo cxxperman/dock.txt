@@ -56,7 +56,15 @@ const compactValue = () => {
   check(groups.length === 3 && groups[2].title === 'Виджеты' && groups[2].items.length === 7, 'dock.settings has three groups, the last is «Виджеты» with 7 switches');
   check(ISLAND.every(k => item(k).value === false) && ['widgetVolume', 'widgetBattery', 'widgetClock', 'badges'].every(k => item(k).value === true), 'a new dock: music, calendar and weather are off (the island shows them), volume, battery, clock and badges on');
   check(ISLAND.every(k => /остров kapsula\.txt/.test(item(k).hint)), 'their hints point to the island kapsula.txt');
-  check(!JSON.stringify(states['dock.settings']).includes('"section"'), 'no dock setting is about games or autostart: nothing moves to a shared page of core.txt');
+  let r0;
+  const sectioned = [];
+  for (const g of groups) for (const i of g.items) if (i.section) sectioned.push(i.key + ':' + i.section);
+  check(JSON.stringify(sectioned) === JSON.stringify(['autostart:startup']) && item('autostart').type === 'switch' && item('autostart').value === false && item('autostart').label === 'Запускать вместе с Windows',
+    'only «Запускать вместе с Windows» moves to core.txt («Общие» → «Запуск и обновления»), off by default — ' + JSON.stringify(sectioned));
+  r0 = await kapsula.command('dock', 'settings.set', { key: 'autostart', value: true });
+  check(r0.ok === true && await until(() => item('autostart').value === true, 3000), 'settings.set autostart=true is accepted and republished (without a window the Windows registry is not touched)');
+  await kapsula.command('dock', 'settings.set', { key: 'autostart', value: false });
+  check(await until(() => item('autostart').value === false, 3000) && saved().autostart === undefined, 'autostart switches back off and is not kept in state.json: Windows itself remembers it');
   check(saved().islandWidgets === true, 'the first run writes the one-time mark to state.json');
   check(JSON.stringify(states['dock.tray']) === JSON.stringify({ items: [{ key: 'autoHide', label: 'Автоскрытие', check: false }, { key: 'settings', label: 'Настройки' }] }), 'dock.tray: «Автоскрытие» with a check mark and «Настройки», no «Открыть» — ' + JSON.stringify(states['dock.tray']));
   check(JSON.stringify(states['dock.keys']) === JSON.stringify({ keys: [{ id: 'winKey', label: 'Меню приложений', keys: 'Win', on: false }] }), 'dock.keys: the Windows key, off while dock.txt does not replace the taskbar — ' + JSON.stringify(states['dock.keys']));
