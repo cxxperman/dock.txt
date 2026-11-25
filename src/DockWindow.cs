@@ -274,12 +274,12 @@ namespace DevTxt.DockApp
                     if (m == AppBar.Callback && m != 0)
                     {
                         int code = w.ToInt32();
-                        if (code == AppBar.ABN_POSCHANGED) { AppBar.Dirty(); Dispatcher.BeginInvoke(new Action(Rebuild)); }
+                        if (code == AppBar.ABN_POSCHANGED) { AppBar.Dirty(); Dispatcher.BeginInvoke(new Action(delegate { Rebuild(); KickAutoHide(); })); }
                         else if (code == AppBar.ABN_FULLSCREENAPP) Dispatcher.BeginInvoke(new Action(SyncGame));
                         return IntPtr.Zero;
                     }
                     // Проводник перезапустился и снова показал свою панель задач — прячем её заново; полосу дока он забыл
-                    if (m == TaskbarSwap.TaskbarCreated && msg != 0) { AppBar.Lost(); Dispatcher.BeginInvoke(new Action(delegate { SyncTaskbar(); Rebuild(); })); }
+                    if (m == TaskbarSwap.TaskbarCreated && msg != 0) { AppBar.Lost(); Dispatcher.BeginInvoke(new Action(delegate { SyncTaskbar(); Rebuild(); KickAutoHide(); })); }
                     // Переключили «Эффекты прозрачности» (и другие общие настройки) — смотрим, нужно ли размытие;
                     // рабочая область экрана сменилась — док встаёт заново (чуть позже: пусть WPF сначала узнает её сам)
                     else if (msg == WM_SETTINGCHANGE)
@@ -337,7 +337,9 @@ namespace DevTxt.DockApp
                 hub.PublishApps(items);
                 ApplyAutoHide();
                 SyncTaskbar();
-                taskbarTimer.Tick += delegate { TaskbarSwap.Keep(store.Dir); };
+                // Раз в секунду: панель задач спрятана и с автоскрытием; не освободилось ли её место (или не занято ли снова)
+                taskbarTimer.Tick += delegate { TaskbarSwap.Keep(store.Dir); ReserveCheck(); };
+                autoHideCheck.Tick += delegate { AutoHideTick(); };
                 taskbarTimer.Start();
                 hookTimer.Tick += delegate { WinKey.Refresh(); };
                 hookTimer.Start();
@@ -381,7 +383,7 @@ namespace DevTxt.DockApp
                 TaskbarSwap.Give(store.Dir);
             }
             // Панель Windows спряталась — её место освободилось: полоса дока опускается к самому краю
-            if (store.ReplaceTaskbar) { AppBar.Dirty(); Rebuild(); }
+            if (store.ReplaceTaskbar) { AppBar.Dirty(); Rebuild(); KickAutoHide(); }
             WinKey.Sync(store.ReplaceTaskbar && store.WinKey, store.ReplaceTaskbar, Dispatcher, WinPressed, WinDigitPressed);
             // Компактная панель Windows: включаем, только когда её выбрали; иначе возвращаем, как было до нас
             bool changed = store.Bar == "modern" ? TaskbarSwap.CompactOn(store.Dir) : TaskbarSwap.CompactBack(store.Dir);
@@ -428,7 +430,7 @@ namespace DevTxt.DockApp
         {
             if (ended) return;
             ended = true;
-            refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop(); shellTimer.Stop();
+            refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop(); shellTimer.Stop(); autoHideCheck.Stop();
             previewOpen.Stop(); previewShut.Stop(); previewPoll.Stop();
             if (preview != null) { try { preview.Close(); } catch { } preview = null; }
             StopLoop();
@@ -757,9 +759,52 @@ namespace DevTxt.DockApp
             PxRect mon;
             bool known = Win.PrimaryMonitor(out mon);
             int h = AppBarRules.Height(RestDip, Scale);
-            PxRect r = AppBar.Registered ? AppBar.Band : AppBarRules.Propose(mon, h);
-            return HubLink.Msg("wanted", known && AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide), "registered", AppBar.Registered,
-                "height", h, "restDip", RestDip, "scale", Scale, "rect", new object[] { r.L, r.T, r.R, r.B });
+            PxRect r = AppBar.Registered ? AppBar.Band : AppBarRules.Ask(mon, AppBarRules.Missing(h, reserve), reserve);
+            return HubLink.Msg("wanted", known && AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide, true), "registered", AppBar.Registered,
+                "height", h, "reserved", reserve, "restDip", RestDip, "scale", Scale, "rect", new object[] { r.L, r.T, r.R, r.B });
+        }
+
+        // Сколько внизу главного монитора держит спрятанная доком панель задач (без автоскрытия) и на каком мониторе
+        // это посчитано — по ним своя полоса и низ дока (AppBarRules.Reserved, Missing, BottomPx)
+        int reserve;
+        PxRect reserveMon;
+
+        int TaskbarReserve(PxRect mon)
+        {
+            if (demo || headless || !store.ReplaceTaskbar || !TaskbarSwap.Active) return 0;
+            PxRect bar;
+            bool autoHidden;
+            if (!TaskbarSwap.Where(out bar, out autoHidden)) return 0;
+            return AppBarRules.Reserved(mon, bar, autoHidden);
+        }
+
+        // Автоскрытие спрятанной панели задач: Проводник включает его не сразу, а иногда не принимает с первого раза.
+        // Несколько раз по таймеру (не останавливая окно дока) просим ещё раз и смотрим, не освободилось ли её место.
+        readonly DispatcherTimer autoHideCheck = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(AppBarRules.RecheckMs) };
+        int autoHideTries;
+
+        void KickAutoHide()
+        {
+            if (demo || headless || ended || !store.ReplaceTaskbar || autoHideCheck.IsEnabled) return;
+            autoHideTries = AppBarRules.RecheckTries;
+            autoHideCheck.Start();
+        }
+
+        void AutoHideTick()
+        {
+            if (ended || !store.ReplaceTaskbar || !TaskbarSwap.Active) { autoHideCheck.Stop(); return; }
+            bool on = TaskbarSwap.EnsureAutoHide();
+            ReserveCheck();
+            if (on || --autoHideTries <= 0) autoHideCheck.Stop();
+        }
+
+        // Место под спрятанной панелью задач освободилось или снова занято — своя полоса и док встают заново
+        void ReserveCheck()
+        {
+            if (demo || headless || ended || me == IntPtr.Zero) return;
+            PxRect mon;
+            if (!Win.PrimaryMonitor(out mon)) return;
+            if (TaskbarReserve(mon) != reserve) { AppBar.Dirty(); Rebuild(); }
         }
 
         object[] AttentionState()
@@ -774,24 +819,40 @@ namespace DevTxt.DockApp
         }
 
         // Занять своё место у Windows или отдать его — по настройкам. true — полоса появилась, ушла или сдвинулась.
+        // Своё место занимается только после того, как панель задач спрятана (AppBarRules.Wanted, taken), и перед этим
+        // ещё раз проверяется её автоскрытие: нет его — просим снова, а пока Windows держит её место, занимаем только
+        // недостающее до высоты дока (AppBarRules.Missing), и док стоит у самого низа монитора.
         bool SyncAppBar()
         {
+            reserve = 0;
             if (demo || headless || me == IntPtr.Zero || ended) return false;
             PxRect mon;
-            bool want = AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide) && Win.PrimaryMonitor(out mon);
-            if (!want) return AppBar.Sync(me, store.Dir, false, new PxRect(), 0);
-            Win.PrimaryMonitor(out mon);
-            return AppBar.Sync(me, store.Dir, true, mon, AppBarRules.Height(RestDip, Scale));
+            bool known = Win.PrimaryMonitor(out mon);
+            if (known && store.ReplaceTaskbar && TaskbarSwap.Active)
+            {
+                if (!TaskbarSwap.EnsureAutoHide()) KickAutoHide();
+                reserve = TaskbarReserve(mon);
+                reserveMon = mon;
+            }
+            bool want = known && AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide, TaskbarSwap.Taken);
+            if (!want) return AppBar.Sync(me, store.Dir, false, new PxRect(), 0, 0);
+            return AppBar.Sync(me, store.Dir, true, mon, AppBarRules.Height(RestDip, Scale), reserve);
         }
 
         // Где стоит док: рабочая область главного монитора, а пока он занял своё место — по низу этого места
-        // (рабочая область тогда кончается над ним)
+        // (рабочая область тогда кончается над ним). Если ниже осталось только место спрятанной панели задач
+        // (Windows не включила ей автоскрытие) — у самого низа монитора, поверх этого места (AppBarRules.BottomPx).
         Rect Area
         {
             get
             {
-                if (!AppBar.Registered) return work;
-                double bottom = AppBarRules.BottomDip(AppBar.Band, Scale);
+                int above;
+                PxRect wk;
+                if (AppBar.Registered) above = AppBar.Band.B;
+                else if (reserve > 0 && Win.PrimaryWork(out wk)) above = wk.B;
+                else return work;
+                int bottomPx = AppBarRules.BottomPx(reserveMon, above, reserve);
+                double bottom = AppBarRules.BottomDip(new PxRect(0, 0, 0, bottomPx), Scale);
                 return new Rect(work.Left, work.Top, work.Width, Math.Max(0, bottom - work.Top));
             }
         }

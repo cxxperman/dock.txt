@@ -29,7 +29,43 @@ namespace DevTxt.DockApp
         // (ABM_SETAUTOHIDEBAR) нельзя: такой на нижнем краю у Windows может быть только один, и это спрятанная доком
         // панель задач Windows (ей включено автоскрытие). Полоса нулевой высоты тоже ни к чему — её просто не регистрируем.
         // Рядом с панелью задач Windows («dock.txt и панель Windows») место не занимаем: там док стоит над панелью, как стоял.
-        public static bool Wanted(bool live, bool replaceTaskbar, bool autoHide) { return live && replaceTaskbar && !autoHide; }
+        // taken — панель задач Windows уже спрятана доком (или её нет вовсе): раньше места не занимаем, иначе Windows
+        // поставит полосу над местом, которое ещё держит за собой видимая панель, и док повиснет над пустой полосой.
+        public static bool Wanted(bool live, bool replaceTaskbar, bool autoHide, bool taken) { return live && replaceTaskbar && !autoHide && taken; }
+
+        // Повторная проверка автоскрытия спрятанной панели задач: Проводник включает его не сразу (а иногда не включает
+        // вовсе) — смотрим ещё несколько раз по таймеру, не останавливая окно дока
+        public const int RecheckMs = 300, RecheckTries = 8;
+
+        // Сколько точек внизу монитора Windows всё ещё держит за спрятанной доком панелью задач. С автоскрытием — ничего
+        // (такая панель места не держит). Без него — от её верха до низа монитора, если она стоит у нижнего края этого
+        // монитора; у другого края или на другом мониторе — ничего.
+        public static int Reserved(PxRect monitor, PxRect taskbar, bool autoHide)
+        {
+            if (autoHide || taskbar.Width <= 0 || taskbar.Height <= 0 || monitor.Height <= 0) return 0;
+            if (taskbar.B < monitor.B || taskbar.T <= monitor.T + monitor.Height / 2) return 0;
+            if (taskbar.R <= monitor.L || taskbar.L >= monitor.R) return 0;
+            return Math.Max(0, Math.Min(monitor.B - taskbar.T, monitor.Height));
+        }
+
+        // Сколько занимать самому: док стоит у самого низа монитора, поверх места спрятанной панели, а своя полоса —
+        // только на то, чего этому месту не хватает до высоты дока. Тогда рабочая область кончается ровно у верха дока.
+        public static int Missing(int height, int reserved) { return Math.Max(0, height - Math.Max(0, reserved)); }
+
+        // Что предложить Windows, когда снизу ещё держит место панель задач: полоса недостающей высоты прямо над этим местом
+        public static PxRect Ask(PxRect monitor, int height, int reserved)
+        {
+            reserved = Math.Max(0, Math.Min(reserved, monitor.Height));
+            return Propose(new PxRect(monitor.L, monitor.T, monitor.R, monitor.B - reserved), height);
+        }
+
+        // Низ дока в точках экрана. above — низ того, над чем он встал бы: своей полосы, а без неё — рабочей области.
+        // Если ниже остаётся только место спрятанной панели задач, док встаёт к самому низу монитора, а не над пустотой.
+        public static int BottomPx(PxRect monitor, int above, int reserved)
+        {
+            if (reserved > 0 && Math.Abs(above - (monitor.B - reserved)) <= 1) return monitor.B;
+            return above;
+        }
 
         // Высота полосы в точках экрана: высота дока в покое (в точках WPF) на масштаб экрана, с округлением вверх
         public static int Height(double restDip, double scale)

@@ -26,7 +26,7 @@ namespace DevTxt.DockApp
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
 
-        const uint ABM_GETSTATE = 4, ABM_SETSTATE = 10;
+        const uint ABM_GETSTATE = 4, ABM_GETTASKBARPOS = 5, ABM_SETSTATE = 10;
         const int ABS_AUTOHIDE = 1, ABS_ALWAYSONTOP = 2;
 
         public static bool Active;            // панель задач сейчас спрятана доком
@@ -86,6 +86,38 @@ namespace DevTxt.DockApp
             }
             if ((GetState() & ABS_AUTOHIDE) == 0) SetState(ABS_AUTOHIDE | (before & ABS_ALWAYSONTOP));   // окна получают весь экран
             ShowAll(false);
+        }
+
+        // Своё место доку можно занимать: панель задач уже спрятана им — или её нет вовсе (Проводник не запущен)
+        public static bool Taken { get { return Active || Bar() == IntPtr.Zero; } }
+
+        // Ещё раз попросить автоскрытие у спрятанной доком панели задач, если его у неё нет (Windows могла не принять
+        // прошлую просьбу или его сбросил кто-то другой). true — оно уже включено; false — попросили, применится не сразу.
+        public static bool EnsureAutoHide()
+        {
+            if (!Active || Bar() == IntPtr.Zero) return true;
+            if ((GetState() & ABS_AUTOHIDE) != 0) return true;
+            SetState(ABS_AUTOHIDE | (before & ABS_ALWAYSONTOP));
+            return false;
+        }
+
+        // Где стоит панель задач Windows (точки экрана) и включено ли у неё автоскрытие. Только чтение.
+        public static bool Where(out PxRect rect, out bool autoHide)
+        {
+            rect = new PxRect();
+            autoHide = false;
+            IntPtr bar = Bar();
+            if (bar == IntPtr.Zero) return false;
+            var d = new APPBARDATA { Size = Marshal.SizeOf(typeof(APPBARDATA)), Hwnd = bar };
+            if (SHAppBarMessage(ABM_GETTASKBARPOS, ref d) != IntPtr.Zero) rect = new PxRect(d.L, d.T, d.R, d.B);
+            else
+            {
+                RECT r;
+                if (!GetWindowRect(bar, out r)) return false;
+                rect = new PxRect(r.L, r.T, r.R, r.B);
+            }
+            autoHide = (GetState() & ABS_AUTOHIDE) != 0;
+            return true;
         }
 
         // Вернуть панель задач такой, какой она была
@@ -230,7 +262,7 @@ namespace DevTxt.DockApp
         static IntPtr owner;
         static bool registered, dirty = true;
         static PxRect band, monitorWas;
-        static int heightWas;
+        static int heightWas, reservedWas;
         static string markerDir;
 
         public static bool Registered { get { return registered; } }
@@ -249,15 +281,18 @@ namespace DevTxt.DockApp
         // Проводник перезапустился — он забыл все полосы: зарегистрироваться заново
         public static void Lost() { lock (gate) { registered = false; dirty = true; } }
 
-        // Привести к нужному: want — занимать ли место, monitor — главный монитор, height — высота полосы (точки экрана).
+        // Привести к нужному: want — занимать ли место, monitor — главный монитор, height — высота дока в покое (точки
+        // экрана), reserved — сколько внизу монитора ещё держит спрятанная панель задач без автоскрытия (AppBarRules.Reserved).
+        // Занимается только недостающее (AppBarRules.Missing): док стоит у самого низа, поверх места панели.
         // true — полоса появилась, ушла или сдвинулась: док ставится заново. Одно и то же второй раз Windows не передаётся.
-        public static bool Sync(IntPtr hwnd, string dir, bool want, PxRect monitor, int height)
+        public static bool Sync(IntPtr hwnd, string dir, bool want, PxRect monitor, int height, int reserved)
         {
             lock (gate)
             {
+                height = AppBarRules.Missing(height, reserved);
                 if (!want || hwnd == IntPtr.Zero || height <= 0) return RemoveLocked();
                 if (registered && owner != hwnd) RemoveLocked();
-                if (registered && !dirty && height == heightWas && monitor.Same(monitorWas)) return false;
+                if (registered && !dirty && height == heightWas && reserved == reservedWas && monitor.Same(monitorWas)) return false;
                 bool fresh = !registered;
                 if (fresh)
                 {
@@ -269,8 +304,8 @@ namespace DevTxt.DockApp
                     try { string f = Marker(dir); if (f != null) { Directory.CreateDirectory(dir); File.WriteAllText(f, hwnd.ToInt64().ToString()); } } catch { }
                 }
                 dirty = false;
-                heightWas = height; monitorWas = monitor;
-                PxRect ask = AppBarRules.Propose(monitor, height);
+                heightWas = height; reservedWas = reserved; monitorWas = monitor;
+                PxRect ask = AppBarRules.Ask(monitor, height, reserved);
                 APPBARDATA q = Data(hwnd);
                 q.L = ask.L; q.T = ask.T; q.R = ask.R; q.B = ask.B;
                 SHAppBarMessage(ABM_QUERYPOS, ref q);

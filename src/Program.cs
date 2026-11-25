@@ -772,10 +772,32 @@ namespace DevTxt.DockApp
         static void Habits()
         {
             // ── Своё место (AppBar) ──
-            Check(AppBarRules.Wanted(true, true, false), "a visible dock that replaces the taskbar takes its place at the bottom");
-            Check(!AppBarRules.Wanted(true, true, true), "with auto-hide it takes no place at all");
-            Check(!AppBarRules.Wanted(true, false, false), "next to the Windows taskbar (or with the compact one) it takes none either");
-            Check(!AppBarRules.Wanted(false, true, false), "a snapshot, --demo or --headless never registers anything");
+            Check(AppBarRules.Wanted(true, true, false, true), "a visible dock that replaces the taskbar takes its place at the bottom");
+            Check(!AppBarRules.Wanted(true, true, true, true), "with auto-hide it takes no place at all");
+            Check(!AppBarRules.Wanted(true, false, false, true), "next to the Windows taskbar (or with the compact one) it takes none either");
+            Check(!AppBarRules.Wanted(false, true, false, true), "a snapshot, --demo or --headless never registers anything");
+            Check(!AppBarRules.Wanted(true, true, false, false), "not before the Windows taskbar is hidden (Take first, then the band): otherwise it lands above the place the taskbar still holds");
+            Check(AppBarRules.RecheckMs >= 200 && AppBarRules.RecheckMs <= 500 && AppBarRules.RecheckTries * AppBarRules.RecheckMs >= 2000 && AppBarRules.RecheckTries * AppBarRules.RecheckMs <= 4000, "the taskbar's auto-hide is asked again and rechecked every " + AppBarRules.RecheckMs + " ms for 2–4 s");
+            // Числа с живой машины: экран 3440×1440, 100 %, панель задач 0,1368–3440,1440 спрятана, а автоскрытие Windows не включила
+            PxRect wide = new PxRect(0, 0, 3440, 1440), held = new PxRect(0, 1368, 3440, 1440);
+            int reserved = AppBarRules.Reserved(wide, held, false), missing = AppBarRules.Missing(77, reserved);
+            PxRect small = AppBarRules.Settle(AppBarRules.Ask(wide, missing, reserved), wide, missing);
+            int bottom = AppBarRules.BottomPx(wide, small.B, reserved);
+            Check(reserved == 72 && missing == 5, "the hidden taskbar without auto-hide still holds 72 px: the dock takes only the missing 5 px, got " + reserved + " and " + missing);
+            Check(small.Same(new PxRect(0, 1363, 3440, 1368)), "the 5 px band sits right above the taskbar's place, so the work area ends at 1440 − 77 = 1363, got " + small);
+            Check(bottom == 1440 && bottom - 77 == small.T, "the dock stands at the very bottom, 1363–1440, over the taskbar's place, not above an empty strip; got bottom " + bottom);
+            Check(AppBarRules.BottomPx(wide, 1368, 72) == 1440 && AppBarRules.BottomPx(wide, 1367, 72) == 1440, "with no band of its own (auto-hide, or the taskbar holds enough) the dock still goes down over the taskbar's place");
+            int on = AppBarRules.Reserved(wide, held, true);
+            PxRect fullBand = AppBarRules.Settle(AppBarRules.Ask(wide, AppBarRules.Missing(77, on), on), wide, AppBarRules.Missing(77, on));
+            Check(on == 0 && fullBand.Same(new PxRect(0, 1363, 3440, 1440)) && AppBarRules.BottomPx(wide, fullBand.B, on) == 1440, "once auto-hide is on: the full 77 px at the very bottom, got " + fullBand);
+            Check(AppBarRules.Missing(77, 100) == 0 && AppBarRules.Missing(77, -5) == 77, "a taskbar that holds more than the dock: no band at all; nonsense counts as nothing");
+            Check(AppBarRules.Reserved(wide, new PxRect(0, 0, 3440, 72), false) == 0 && AppBarRules.Reserved(wide, new PxRect(0, 0, 72, 1440), false) == 0 && AppBarRules.Reserved(wide, new PxRect(-1920, 1008, 0, 1080), false) == 0 && AppBarRules.Reserved(wide, new PxRect(), false) == 0,
+                "a taskbar at the top, at a side, on another monitor or not found holds nothing at our bottom");
+            PxRect hi = new PxRect(0, 0, 2880, 1620);   // 150 %: панель 72 × 1,5 = 108, док 77 × 1,5 → 116
+            int r150 = AppBarRules.Reserved(hi, new PxRect(0, 1512, 2880, 1620), false), m150 = AppBarRules.Missing(AppBarRules.Height(77, 1.5), r150);
+            PxRect b150 = AppBarRules.Settle(AppBarRules.Ask(hi, m150, r150), hi, m150);
+            Check(r150 == 108 && m150 == 8 && b150.Same(new PxRect(0, 1504, 2880, 1512)) && AppBarRules.BottomPx(hi, b150.B, r150) == 1620, "at 150 %: 108 held, 8 px band at 1504–1512, the dock at 1504–1620; got " + b150);
+            Check(AppBarRules.BottomPx(wide, 1300, 72) == 1300 && AppBarRules.BottomPx(wide, 1368, 0) == 1368, "another bar between the dock and the taskbar's place, or nothing held: the dock stays where it was");
             Check(AppBarRules.Height(77, 1) == 77 && AppBarRules.Height(77, 1.25) == 97 && AppBarRules.Height(77, 1.5) == 116 && AppBarRules.Height(77, 2) == 154, "the band is the dock at rest times the screen scale, rounded up: 77 → 77, 97, 116, 154");
             Check(AppBarRules.Height(76.8, 1.25) == 96 && AppBarRules.Height(0, 1) == 0 && AppBarRules.Height(77, 0) == 77 && AppBarRules.Height(77, double.NaN) == 77, "a whole number of pixels is not rounded up once more; no scale is 100 %");
             PxRect mon = new PxRect(0, 0, 1920, 1080), second = new PxRect(-2560, -200, 0, 1240);

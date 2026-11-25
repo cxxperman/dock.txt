@@ -161,6 +161,21 @@ namespace DevTxt.DockApp
             catch { return false; }
         }
 
+        // Рабочая область главного монитора, в точках экрана (без полос на его краях)
+        public static bool PrimaryWork(out PxRect r)
+        {
+            r = new PxRect();
+            try
+            {
+                IntPtr mon = MonitorFromPoint(new POINT(), MONITOR_DEFAULTTOPRIMARY);
+                var info = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (mon == IntPtr.Zero || !GetMonitorInfo(mon, ref info)) return false;
+                r = new PxRect(info.Work.L, info.Work.T, info.Work.R, info.Work.B);
+                return r.Width > 0 && r.Height > 0;
+            }
+            catch { return false; }
+        }
+
         // Масштаб экрана, когда окна у дока нет (без окна): 1 — 100 %, 1,5 — 150 %
         public static double SystemScale()
         {
