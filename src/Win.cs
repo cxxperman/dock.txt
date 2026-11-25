@@ -119,6 +119,54 @@ namespace DevTxt.DockApp
             watch = IntPtr.Zero;
         }
 
+        // ───────── Сообщения об окнах ─────────
+        // Окно дока получает от Windows то же, что получает её панель задач: окно создано, закрыто, вышло вперёд, сменило
+        // заголовок, просит внимания (сообщение SHELLHOOK). Тоже не перехватчик: в чужие программы ничего не внедряется.
+        [DllImport("user32.dll")] static extern bool RegisterShellHookWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool DeregisterShellHookWindow(IntPtr hwnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
+        public static readonly uint ShellMessage = RegisterWindowMessage("SHELLHOOK");
+
+        public static bool WatchShell(IntPtr hwnd)
+        {
+            try { return ShellMessage != 0 && hwnd != IntPtr.Zero && RegisterShellHookWindow(hwnd); } catch { return false; }
+        }
+
+        public static void UnwatchShell(IntPtr hwnd)
+        {
+            try { if (hwnd != IntPtr.Zero) DeregisterShellHookWindow(hwnd); } catch { }
+        }
+
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+        public static bool Alive(IntPtr hwnd) { try { return hwnd != IntPtr.Zero && IsWindow(hwnd); } catch { return false; } }
+
+        // ───────── Монитор дока ─────────
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Monitor, Work; public uint Flags; }
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO info);
+        [DllImport("user32.dll")] static extern uint GetDpiForSystem();
+
+        // Главный монитор целиком, в точках экрана: на нём стоит док
+        public static bool PrimaryMonitor(out PxRect r)
+        {
+            r = new PxRect();
+            try
+            {
+                IntPtr mon = MonitorFromPoint(new POINT(), MONITOR_DEFAULTTOPRIMARY);
+                var info = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (mon == IntPtr.Zero || !GetMonitorInfo(mon, ref info)) return false;
+                r = new PxRect(info.Monitor.L, info.Monitor.T, info.Monitor.R, info.Monitor.B);
+                return r.Width > 0 && r.Height > 0;
+            }
+            catch { return false; }
+        }
+
+        // Масштаб экрана, когда окна у дока нет (без окна): 1 — 100 %, 1,5 — 150 %
+        public static double SystemScale()
+        {
+            try { uint dpi = GetDpiForSystem(); return dpi > 0 ? dpi / 96.0 : 1; } catch { return 1; }
+        }
+
         static string Text(IntPtr hwnd)
         {
             int n = GetWindowTextLength(hwnd);
@@ -389,6 +437,14 @@ namespace DevTxt.DockApp
                 if (item.Pin != null && item.Pin.Args != null) info.Arguments = item.Pin.Args;
                 try { info.WorkingDirectory = Path.GetDirectoryName(item.Path); } catch { }
             }
+            using (Process.Start(info)) { }
+        }
+
+        // Открыть файлы программой: она запускается с их путями (args — готовая строка из OpenWith.Arguments)
+        public static void OpenWith(DockItem item, string args)
+        {
+            var info = new ProcessStartInfo(item.Path, args) { UseShellExecute = true };
+            try { info.WorkingDirectory = Path.GetDirectoryName(item.Path); } catch { }
             using (Process.Start(info)) { }
         }
 

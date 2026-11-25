@@ -15,8 +15,9 @@ namespace DevTxt.DockApp
 {
     class DockHub
     {
-        // Ключ --testhook: док принимает ещё три команды — test.act (нажать кнопку виджета или пункт меню корзины),
-        // test.state (что док решил про игру и «Не беспокоить», что с баком) и test.quit (выйти). Только для проверок.
+        // Ключ --testhook: док принимает ещё четыре команды — test.act (нажать кнопку виджета или пункт меню корзины),
+        // test.state (что док решил про игру и «Не беспокоить», что с баком, своё место у Windows, кто просит внимания),
+        // test.shell (будто Windows прислала сообщение об окне) и test.quit (выйти). Только для проверок.
         public static bool TestHook = false;
 
         readonly DockWindow window;
@@ -37,7 +38,7 @@ namespace DevTxt.DockApp
             this.store = store;
             link = new HubLink("dock", "Dock", Program.VersionText, TestPort > 0 ? TestPort : HubLink.DefaultPort);
             link.Topics = new string[] { "hub.theme", "kapsula.media", "kapsula.weather", "kapsula.calendar", "kapsula.unread", "metla.bin" };
-            link.Commands = TestHook ? new string[] { "settings.set", "test.act", "test.state", "test.quit" } : new string[] { "settings.set" };
+            link.Commands = TestHook ? new string[] { "settings.set", "test.act", "test.state", "test.shell", "test.quit" } : new string[] { "settings.set" };
             link.OnCommand = Command;
             link.OnState = delegate(string topic, object data, string from)
             {
@@ -164,6 +165,15 @@ namespace DevTxt.DockApp
                 try
                 {
                     if (name == "test.state") { answer = window.TestState(); return; }
+                    if (name == "test.shell")
+                    {
+                        // Будто Windows прислала сообщение об окне: { "event": "flash" | "activated" | "destroyed" | "created", "app"?: название }
+                        object ev, app;
+                        args.TryGetValue("event", out ev);
+                        args.TryGetValue("app", out app);
+                        answer = window.TestShell(ev as string, app as string);
+                        return;
+                    }
                     if (name == "test.act")
                     {
                         object widget, action;

@@ -67,7 +67,7 @@ const compactValue = () => {
   check(await until(() => item('autostart').value === false, 3000) && saved().autostart === undefined, 'autostart switches back off and is not kept in state.json: Windows itself remembers it');
   check(saved().islandWidgets === true, 'the first run writes the one-time mark to state.json');
   check(JSON.stringify(states['dock.tray']) === JSON.stringify({ items: [{ key: 'autoHide', label: 'Автоскрытие', check: false }, { key: 'settings', label: 'Настройки' }] }), 'dock.tray: «Автоскрытие» with a check mark and «Настройки», no «Открыть» — ' + JSON.stringify(states['dock.tray']));
-  check(JSON.stringify(states['dock.keys']) === JSON.stringify({ keys: [{ id: 'winKey', label: 'Меню приложений', keys: 'Win', on: false }] }), 'dock.keys: the Windows key, off while dock.txt does not replace the taskbar — ' + JSON.stringify(states['dock.keys']));
+  check(JSON.stringify(states['dock.keys']) === JSON.stringify({ keys: [{ id: 'winKey', label: 'Меню приложений', keys: 'Win', on: false }, { id: 'winDigits', label: 'Закреплённое приложение по номеру', keys: 'Win+1…9', on: false }] }), 'dock.keys: the Windows key and Win+1…9, off while dock.txt does not replace the taskbar — ' + JSON.stringify(states['dock.keys']));
 
   let r = await kapsula.command('dock', 'test.act', { widget: 'music', action: 'next' });
   check(r.ok === false, 'music action is refused while there is no music widget (' + r.error + ')');
@@ -141,13 +141,36 @@ const compactValue = () => {
   r = await core.command('dock', 'tray.run', { key: 'show' });
   check(r.ok === false, 'a tray item the dock does not have is refused (' + r.error + ')');
 
-  r = await core.command('dock', 'settings.set', { key: 'bar', value: 'dock' });
-  check(r.ok === true && await until(() => states['dock.keys'].keys[0].on === true, 3000), 'dock.txt instead of the taskbar: dock.keys lists the Windows key as on');
   s = await stateNow(core);
-  check(s.taskbarTaken === false && s.winKeyHooked === false, 'even then a headless dock hides no taskbar and hooks no key — ' + JSON.stringify(s));
+  check(s.appBar && s.appBar.wanted === false && s.appBar.registered === false, 'next to the Windows taskbar the dock would take no place at the bottom — ' + JSON.stringify(s.appBar));
+  r = await core.command('dock', 'settings.set', { key: 'bar', value: 'dock' });
+  check(r.ok === true && await until(() => states['dock.keys'].keys[0].on === true && states['dock.keys'].keys[1].on === true, 3000), 'dock.txt instead of the taskbar: dock.keys lists the Windows key and Win+1…9 as on');
+  s = await stateNow(core);
+  check(s.taskbarTaken === false && s.winKeyHooked === false && s.winDigits === false, 'even then a headless dock hides no taskbar and hooks no key — ' + JSON.stringify(s));
+  const ab = s.appBar || {};
+  check(ab.wanted === true && ab.registered === false && ab.height === Math.ceil(ab.restDip * ab.scale - 1e-6) && ab.rect[3] - ab.rect[1] === ab.height && ab.rect[2] > ab.rect[0],
+    'a visible dock instead of the taskbar would take a band as high as the dock at rest at the bottom of the main monitor; without a window nothing is registered — ' + JSON.stringify(ab));
+  check(s.edgeDwellMs >= 300 && s.edgeDwellMs <= 400 && s.shellHook === false && s.fallbackMs >= 10000 && s.fallbackMs <= 15000, 'auto-hide waits ' + s.edgeDwellMs + ' ms at the edge; without a window no shell hook, the backup poll is ' + s.fallbackMs + ' ms');
+  r = await core.command('dock', 'settings.set', { key: 'autoHide', value: true });
+  s = await stateNow(core);
+  check(r.ok === true && s.appBar.wanted === false && s.appBar.registered === false, 'with auto-hide the dock would take no place — ' + JSON.stringify(s.appBar));
+  await core.command('dock', 'settings.set', { key: 'autoHide', value: false });
   r = await core.command('dock', 'settings.set', { key: 'winKey', value: false });
-  check(r.ok === true && await until(() => states['dock.keys'].keys[0].on === false, 3000), 'the Windows key setting off: listed as off');
+  check(r.ok === true && await until(() => states['dock.keys'].keys[0].on === false && states['dock.keys'].keys[1].on === true, 3000), 'the Windows key setting off: listed as off, Win+1…9 stay on');
   await core.command('dock', 'settings.set', { key: 'winKey', value: true });
+
+  // ── Окно просит внимания: будто Windows прислала HSHELL_FLASH (test.shell). Без окна дока прыжков нет — сразу точка ──
+  r = await core.command('dock', 'test.shell', { event: 'flash' });
+  if (r.ok) {
+    const who = r.data.name;
+    s = await waitState(core, x => (x.attention || []).some(a => a.name === who), 3000);
+    check((s.attention || []).some(a => a.name === who && a.phase === 'mark'), 'a window asks for attention: its app is marked (no hops without a window) — ' + JSON.stringify(s.attention));
+    r = await core.command('dock', 'test.shell', { event: 'activated', app: who });
+    s = await waitState(core, x => !(x.attention || []).some(a => a.name === who), 3000);
+    check(r.ok === true && !(s.attention || []).some(a => a.name === who), 'the window came forward: the mark is gone — ' + JSON.stringify(s.attention));
+  } else console.log('      (no running app whose window is not ahead — attention not checked: ' + r.error + ')');
+  r = await core.command('dock', 'test.shell', { event: 'nope' });
+  check(r.ok === false, 'an unknown shell message is refused (' + r.error + ')');
   // Компактная панель Windows: дока не видно — «Автоскрытие» в трее видно, но не нажимается
   const compactBefore = compactValue();
   r = await core.command('dock', 'settings.set', { key: 'bar', value: 'modern' });

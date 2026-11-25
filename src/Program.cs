@@ -9,6 +9,7 @@
 //                       --previews — вместе с --demo и --hover N: над значком панель с его окнами (окна нарисованные);
 //                       --drag N — вместе с --demo: закреплённый значок N будто бы несут на два места правее; --out — унесли из дока
 //   --bin full|empty|offline  вместе с --demo: что в выдуманной корзине; --hover bin — курсор над баком
+//   --asking N          вместе с --demo: окно значка N просит внимания (под значком оранжевая точка)
 //   --apps              вместе с --shot: нарисовать меню приложений; --query текст — с этим текстом в поиске
 //   --selftest          проверить сборку значков из окон, закрепление, увеличение, настройки, виджеты, счётчики, названия и поиск в меню,
 //                       пункты для трея и клавиши core.txt и уход из-под игры на весь экран; код выхода 0 — всё в порядке
@@ -92,15 +93,20 @@ namespace DevTxt.DockApp
                 try { if (store.Dir != null) File.AppendAllText(Path.Combine(store.Dir, "dock.log"), DateTime.Now.ToString("s") + " " + e.Exception + "\r\n"); } catch { }
             };
 
-            // Прошлый запуск не вернул панель задач (упал или его закрыли силой), а замена выключена — возвращаем сразу
+            // Прошлый запуск не вернул панель задач (упал или его закрыли силой), а замена выключена — возвращаем сразу.
+            // И не отдал своё место внизу экрана — отдаём за него (своё займём заново, когда окно появится).
             if (!demo && !headless && shot == null && !store.ReplaceTaskbar) TaskbarSwap.Recover(store.Dir);
+            if (!demo && !headless && shot == null) AppBar.Recover(store.Dir);
             if (!demo && !headless && shot == null)
             {
-                AppDomain.CurrentDomain.UnhandledException += delegate { WinKey.Stop(); TaskbarSwap.Give(store.Dir); };
-                app.SessionEnding += delegate { WinKey.Stop(); TaskbarSwap.Give(store.Dir); };
+                // Док падает или сеанс кончается: место внизу экрана освобождается раньше, чем возвращается панель задач
+                AppDomain.CurrentDomain.UnhandledException += delegate { WinKey.Stop(); AppBar.Remove(); TaskbarSwap.Give(store.Dir); };
+                app.SessionEnding += delegate { WinKey.Stop(); AppBar.Remove(); TaskbarSwap.Give(store.Dir); };
             }
             var w = new DockWindow(demo, store, headless, Array.IndexOf(args, "--nohub") < 0);
             if (demo && Arg(args, "--bin") != null) w.DemoBin(Arg(args, "--bin"));
+            int asking;
+            if (demo && Arg(args, "--asking") != null && int.TryParse(Arg(args, "--asking"), out asking)) w.DemoAsk(asking);
             if (shot != null)
             {
                 // Панель с окнами и перетаскивание рисуются только выдуманными: настоящие окна и закреплённое не трогаются
@@ -644,7 +650,9 @@ namespace DevTxt.DockApp
                 "with the compact Windows bar the dock is not on screen: «Автоскрытие» is shown but greyed out, «Настройки» still work, got " + compactJson);
             Check(FamilyRules.CorePage == "app:dock", "«Настройки» open the dock's own page in core.txt");
             List<KeyInfo> keys = FamilyRules.Keys(true, true);
-            Check(keys.Count == 1 && keys[0].Id == "winKey" && keys[0].Label == "Меню приложений" && keys[0].Keys == "Win" && KeyNames.Normal("win") == keys[0].Keys && keys[0].On, "dock.keys: the Windows key opens «Меню приложений»");
+            Check(keys.Count == 2 && keys[0].Id == "winKey" && keys[0].Label == "Меню приложений" && keys[0].Keys == "Win" && KeyNames.Normal("win") == keys[0].Keys && keys[0].On, "dock.keys: the Windows key opens «Меню приложений»");
+            Check(keys[1].Id == "winDigits" && keys[1].Label == "Закреплённое приложение по номеру" && keys[1].Keys == "Win+1…9" && keys[1].On, "dock.keys: Win+1…9 open the pinned apps by number");
+            Check(FamilyRules.Keys(true, false)[1].On && !FamilyRules.Keys(false, true)[1].On, "Win+1…9 work whenever dock.txt replaces the taskbar, even with the Windows key setting off");
             Check(!FamilyRules.Keys(false, true)[0].On && !FamilyRules.Keys(true, false)[0].On && !FamilyRules.Keys(false, false)[0].On, "the Windows key is listed as off unless dock.txt replaces the taskbar and the setting is on");
             string keysJson = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(keys[0].ToData());
             Check(keysJson == "{\"id\":\"winKey\",\"label\":\"Меню приложений\",\"keys\":\"Win\",\"on\":true}", "a key serialises as the protocol shows it, got " + keysJson);
@@ -756,6 +764,130 @@ namespace DevTxt.DockApp
             Check(SessionRules.Confirm("shutdown") == "Точно выключить?" && SessionRules.Confirm("restart") == "Точно перезагрузить?" && SessionRules.Confirm("sleep") == null && SessionRules.Confirm("lock") == null, "only shutdown and restart ask twice");
             Check(!Session.Armed && !Session.Run("lock") && !Session.Run("shutdown"), "a self-test never locks, sleeps or shuts down the computer");
             Bin();
+            Habits();
+        }
+
+        // Док по привычкам Windows: своё место внизу экрана, появление от края, Win+1…9, сообщения об окнах,
+        // «просит внимания», файлы на значке программы
+        static void Habits()
+        {
+            // ── Своё место (AppBar) ──
+            Check(AppBarRules.Wanted(true, true, false), "a visible dock that replaces the taskbar takes its place at the bottom");
+            Check(!AppBarRules.Wanted(true, true, true), "with auto-hide it takes no place at all");
+            Check(!AppBarRules.Wanted(true, false, false), "next to the Windows taskbar (or with the compact one) it takes none either");
+            Check(!AppBarRules.Wanted(false, true, false), "a snapshot, --demo or --headless never registers anything");
+            Check(AppBarRules.Height(77, 1) == 77 && AppBarRules.Height(77, 1.25) == 97 && AppBarRules.Height(77, 1.5) == 116 && AppBarRules.Height(77, 2) == 154, "the band is the dock at rest times the screen scale, rounded up: 77 → 77, 97, 116, 154");
+            Check(AppBarRules.Height(76.8, 1.25) == 96 && AppBarRules.Height(0, 1) == 0 && AppBarRules.Height(77, 0) == 77 && AppBarRules.Height(77, double.NaN) == 77, "a whole number of pixels is not rounded up once more; no scale is 100 %");
+            PxRect mon = new PxRect(0, 0, 1920, 1080), second = new PxRect(-2560, -200, 0, 1240);
+            PxRect ask = AppBarRules.Propose(mon, 77);
+            Check(ask.Same(new PxRect(0, 1003, 1920, 1080)), "proposed: the full width of the monitor at its bottom, got " + ask);
+            Check(AppBarRules.Propose(second, 116).Same(new PxRect(-2560, 1124, 0, 1240)), "a monitor left of and above the main one keeps its own coordinates");
+            Check(AppBarRules.Propose(mon, 5000).Same(new PxRect(0, 0, 1920, 1080)), "never taller than the monitor");
+            Check(AppBarRules.Settle(new PxRect(0, 955, 1920, 1032), mon, 77).Same(new PxRect(0, 955, 1920, 1032)), "Windows lifted it over another bar on the same edge: our height from the bottom it gave");
+            Check(AppBarRules.Settle(new PxRect(0, 1003, 1920, 1080), mon, 77).Same(ask) && AppBarRules.Settle(new PxRect(60, 1003, 1920, 1100), mon, 77).Same(new PxRect(60, 1003, 1920, 1080)), "nothing in the way — the place asked for; a side bar narrows it; never below the monitor");
+            Check(AppBarRules.Settle(new PxRect(0, -50, 1920, 10), mon, 77).Same(new PxRect(0, 0, 1920, 77)) && AppBarRules.Settle(new PxRect(500, 1003, 400, 1080), mon, 77).Same(ask), "an answer that makes no sense is put back on the monitor");
+            Check(Near(AppBarRules.BottomDip(new PxRect(0, 1003, 1920, 1080), 1), 1080) && Near(AppBarRules.BottomDip(new PxRect(0, 1044, 2880, 1160), 1.5), 773.3333333333334) && Near(AppBarRules.BottomDip(new PxRect(0, 1, 2, 1080), 0), 1080), "the dock stands on the bottom of its band, in WPF points");
+
+            // ── Появление от края ──
+            var edge = new EdgeReveal();
+            Check(EdgeReveal.DwellMs >= 300 && EdgeReveal.DwellMs <= 400, "the cursor has to rest at the edge 0.3–0.4 s");
+            bool shown = false;
+            for (long t = 0; t <= 300; t += 50) shown |= edge.Step(t, true, false);
+            Check(!shown && edge.Step(350, true, false), "resting at the edge: nothing for 0.3 s, then at 0.35 s the dock comes out");
+            edge = new EdgeReveal();
+            shown = false;
+            long[] path = { 0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500 };
+            bool[] near = { true, true, true, false, true, true, true, true, false, true, true };   // курсор ездит к прокрутке и обратно
+            for (int i = 0; i < path.Length; i++) shown |= edge.Step(path[i], near[i], false);
+            Check(!shown, "passing the edge on the way to a scroll bar or a button at the bottom of a window never brings the dock out");
+            edge = new EdgeReveal();
+            shown = false;
+            for (long t = 0; t <= 5000; t += 50) shown |= edge.Step(t, true, true);
+            Check(!shown, "a game or a video on the full screen: the cursor may rest at the bottom for seconds, the dock stays away");
+            edge = new EdgeReveal();
+            edge.Step(0, true, false); edge.Step(300, true, false);
+            Check(!edge.Step(320, true, true) && !edge.Step(400, true, false) && edge.Step(750, true, false), "a game that came in the middle starts the wait over");
+            Check(edge.Step(0, true, false) == false && edge.Step(400, true, false), "after coming out the next rest is counted afresh");
+
+            // ── Win+1…9 ──
+            Check(WinDigit.Index(0x31, false, false, false) == 0 && WinDigit.Index(0x39, false, false, false) == 8 && WinDigit.Index(0x35, false, false, false) == 4, "Win+1 is the first pin, Win+9 the ninth");
+            Check(WinDigit.Index(0x30, false, false, false) == -1 && WinDigit.Index(0x61, false, false, false) == -1 && WinDigit.Index(0x45, false, false, false) == -1, "Win+0, the number pad and Win+E stay with Windows");
+            Check(WinDigit.Index(0x31, true, false, false) == -1 && WinDigit.Index(0x31, false, true, false) == -1 && WinDigit.Index(0x31, false, false, true) == -1, "with Shift, Ctrl or Alt the combination stays with Windows");
+            var dock = new List<DockItem>
+            {
+                new DockItem { Key = "a", Name = "A", Path = @"C:\a.exe", Pinned = true },
+                new DockItem { Key = "b", Name = "B", Path = @"C:\b.exe", Pinned = true },
+                new DockItem { Key = "c", Name = "C", Path = @"C:\c.exe", Pinned = true },
+                new DockItem { Key = "r", Name = "R", Path = @"C:\r.exe" }
+            };
+            dock[1].Windows.Add(new IntPtr(21));
+            dock[2].Windows.Add(new IntPtr(31)); dock[2].Windows.Add(new IntPtr(32));
+            dock[3].Windows.Add(new IntPtr(41));
+            DockItem got;
+            Click what;
+            IntPtr target;
+            Check(WinDigit.Decide(dock, 0, new IntPtr(41), out got, out what, out target) && got == dock[0] && what == Click.Launch, "Win+1, not running: launch");
+            Check(WinDigit.Decide(dock, 1, new IntPtr(41), out got, out what, out target) && got == dock[1] && what == Click.Activate && target == new IntPtr(21), "Win+2, running behind another window: bring it forward");
+            Check(WinDigit.Decide(dock, 1, new IntPtr(21), out got, out what, out target) && what == Click.Minimize && target == new IntPtr(21), "Win+2 again, its only window ahead: minimise it");
+            Check(WinDigit.Decide(dock, 2, new IntPtr(31), out got, out what, out target) && what == Click.Activate && target == new IntPtr(32), "Win+3 with two windows, one ahead: the next window");
+            Check(!WinDigit.Decide(dock, 3, IntPtr.Zero, out got, out what, out target) && got == null && !WinDigit.Decide(dock, 8, IntPtr.Zero, out got, out what, out target) && !WinDigit.Decide(dock, -1, IntPtr.Zero, out got, out what, out target) && !WinDigit.Decide(null, 0, IntPtr.Zero, out got, out what, out target),
+                "only pinned apps count: Win+4 with three pins does nothing (the running app is not numbered)");
+
+            // ── Сообщения Windows об окнах ──
+            var batch = new ShellBatch();
+            Check(!batch.Pending && batch.Add(ShellCodes.Created, new IntPtr(1), 1000) == 1000 + ShellBatch.QuickMs && batch.Pending, "a new window: the batch is read 120 ms later");
+            Check(batch.Add(ShellCodes.Redraw, new IntPtr(1), 1010) == 1120 && batch.Add(ShellCodes.Activated, new IntPtr(1), 1050) == 1120, "later messages never push the moment away");
+            Check(batch.Add(7, new IntPtr(1), 1060) == -1 && batch.Add(ShellCodes.Activated | 0x100, IntPtr.Zero, 1060) == -1 && batch.Due == 1120, "messages the dock does not need are ignored");
+            ShellSummary sum = batch.Take();
+            Check(sum.Windows && sum.Titles && sum.Attention.Count == 1 && !sum.Attention[0].Value && !batch.Pending, "one batch: windows re-read once, titles too, the activated window loses its request");
+            Check(batch.Add(ShellCodes.Redraw, new IntPtr(5), 2000) == 2000 + ShellBatch.TitleMs && batch.Add(ShellCodes.Redraw, new IntPtr(6), 2500) == 3000, "only titles changing — at most once a second");
+            Check(batch.Add(ShellCodes.Destroyed, new IntPtr(5), 2600) == 2720, "…but a closed window brings the moment closer");
+            sum = batch.Take();
+            Check(sum.Windows && sum.Gone.Count == 1 && sum.Gone[0] == new IntPtr(5), "a closed window is in the batch");
+            for (int i = 0; i < 40; i++) batch.Add(i % 2 == 0 ? ShellCodes.Created : ShellCodes.RudeActivated, new IntPtr(100 + i), 3000 + i);
+            batch.Add(ShellCodes.Flash, new IntPtr(7), 3050);
+            batch.Add(ShellCodes.MonitorChanged, new IntPtr(7), 3060);
+            sum = batch.Take();
+            Check(sum.Windows && !sum.Titles && sum.Attention.Count == 21 && sum.Attention[20].Key == new IntPtr(7) && sum.Attention[20].Value, "forty messages from a starting program make one re-read; the request for attention keeps its order");
+            Check(ShellCodes.Flash == 0x8006 && ShellCodes.RudeActivated == 0x8004 && ShellCodes.Replaced == 13 && ShellCodes.MonitorChanged == 16, "the codes are those of HSHELL_FLASH, HSHELL_RUDEAPPACTIVATED, HSHELL_WINDOWREPLACED, HSHELL_MONITORCHANGED");
+
+            // ── Просит внимания ──
+            var att = new Attention();
+            var chat = new DockItem { Key = "chat", Name = "Chat", Path = @"C:\chat.exe" };
+            chat.Windows.Add(new IntPtr(70)); chat.Windows.Add(new IntPtr(71));
+            Check(att.Since(chat) == -1 && Attention.Phase(-1, 0, false, 560) == AttentionPhase.None, "nobody asks: nothing to show");
+            Check(!att.Flash(new IntPtr(70), new IntPtr(70), 1000) && att.Count == 0, "the window ahead does not ask (Windows does not flash it either)");
+            Check(att.Flash(new IntPtr(71), new IntPtr(1), 1000) && !att.Flash(new IntPtr(71), new IntPtr(1), 1300) && att.Since(chat) == 1000, "a window asks once; asking again does not start the hops over");
+            Check(Attention.Hops >= 2 && Attention.Hops <= 3, "two or three hops");
+            Check(Attention.Phase(att.Since(chat), 1000, false, 560) == AttentionPhase.Bounce && Attention.Phase(att.Since(chat), 1000 + 3 * 560 - 1, false, 560) == AttentionPhase.Bounce, "first the icon hops");
+            Check(Attention.Phase(att.Since(chat), 1000 + 3 * 560, false, 560) == AttentionPhase.Mark && Attention.Phase(att.Since(chat), 99999, false, 560) == AttentionPhase.Mark, "then the orange dot stays");
+            Check(Attention.Phase(att.Since(chat), 1000, true, 560) == AttentionPhase.Mark, "with «Меньше движения» (or «Не беспокоить») — no hops, the dot at once");
+            Check(att.Clear(new IntPtr(71)) && att.Since(chat) == -1 && !att.Clear(new IntPtr(71)), "the window came forward: the request is gone");
+            att.Flash(new IntPtr(70), IntPtr.Zero, 5); att.Flash(new IntPtr(99), IntPtr.Zero, 6);
+            att.Keep(delegate(IntPtr h) { return h != new IntPtr(99); });
+            Check(att.Count == 1 && att.Since(chat) == 5, "a closed window no longer asks");
+            Check(att.Since(null) == -1 && !att.Flash(IntPtr.Zero, IntPtr.Zero, 0), "no window — no request");
+
+            // ── Файлы на значке программы ──
+            Func<string, bool> real = delegate(string p) { return p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !p.Contains("gone"); };
+            var paint = new DockItem { Key = "p", Name = "Paint", Path = @"C:\Windows\paint.exe", Pinned = true, Pin = new Pin { Name = "Paint", Path = @"C:\Windows\paint.exe" } };
+            var pinArgs = new DockItem { Key = "e", Name = "Edge", Path = @"C:\e\msedge.exe", Pinned = true, Pin = new Pin { Name = "Edge", Path = @"C:\e\msedge.exe", Args = "--profile-directory=Default" } };
+            var squirrel = new DockItem { Key = "d", Name = "Discord", Path = @"C:\Users\u\AppData\Local\Discord\Update.exe", Pinned = true, Pin = new Pin { Name = "Discord", Path = @"C:\Users\u\AppData\Local\Discord\Update.exe", Args = "--processStart Discord.exe" } };
+            var store = new DockItem { Key = "app|calc", Name = "Калькулятор", Path = Logic.AppsFolder + "Calc!App", App = "Calc!App" };
+            Check(OpenWith.Accepts(paint, real) && OpenWith.Accepts(pinArgs, real), "an ordinary program takes files dropped on its icon");
+            Check(!OpenWith.Accepts(store, real) && !OpenWith.Accepts(squirrel, real) && !OpenWith.Accepts(new DockItem { Path = @"C:\gone\x.exe" }, real) && !OpenWith.Accepts(new DockItem { Path = @"C:\x.lnk" }, real) && !OpenWith.Accepts(null, real),
+                "a Store app, a program started through Update.exe, a missing file or not a program — no");
+            var files = new List<string> { @"C:\Фото\кот.png", @"D:\a b\c.txt" };
+            Check(OpenWith.Arguments(null, files) == "\"C:\\Фото\\кот.png\" \"D:\\a b\\c.txt\"", "the paths go after the program, each in quotes, got " + OpenWith.Arguments(null, files));
+            Check(OpenWith.Arguments(" --profile-directory=Default ", files) == "--profile-directory=Default \"C:\\Фото\\кот.png\" \"D:\\a b\\c.txt\"", "the shortcut's own parameters come first");
+            Check(OpenWith.Arguments(null, new List<string> { "C:\\bad\"name.txt", "" }) == null && OpenWith.Arguments(null, null) == null && OpenWith.Arguments("--x", new List<string>()) == null, "nothing usable — nothing is started");
+            var many = new List<string>();
+            for (int i = 0; i < 2000; i++) many.Add(@"C:\very\long\folder\name\for\testing\file-" + i + ".txt");
+            string longArgs = OpenWith.Arguments(null, many);
+            Check(longArgs != null && longArgs.Length <= OpenWith.MaxArgs && longArgs.EndsWith(".txt\""), "too many files: as many as fit into a Windows command line, none cut in half");
+            Check(OpenWith.Tip("Paint") == "Открыть в «Paint»" && OpenWith.Failed == "Не удалось открыть", "the label over the icon: «Открыть в «Paint»»");
+            List<string> picked = BinRules.DropPaths(new string[] { @"C:\keep\a.txt", @"C:\" }, delegate(string p) { return true; });
+            Check(picked.Count == 1 && OpenWith.Arguments(null, picked) == "\"C:\\keep\\a.txt\"", "the same check as for the bin: full paths that exist, never a drive root");
         }
 
         static string Menu(List<BinRow> rows)

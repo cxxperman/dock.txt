@@ -1,4 +1,5 @@
-// dock.txt. Taskbar.cs — док вместо панели задач Windows и меню приложений по кнопке Windows.
+// dock.txt. Taskbar.cs — док вместо панели задач Windows: своё место внизу экрана (AppBar), меню приложений по кнопке
+// Windows и Win+1…9.
 // Панель задач не удаляется и не ломается: ей включается автоскрытие (чтобы окна занимали весь экран) и она
 // прячется. Как было — записано в файл рядом с настройками: при выходе дока всё возвращается, а если док упал,
 // вернёт core.txt (он смотрит на этот же файл) или сам док при следующем запуске.
@@ -207,8 +208,135 @@ namespace DevTxt.DockApp
         }
     }
 
+    // Своё место дока на экране: полоса внизу, которую Windows не отдаёт развёрнутым окнам (AppBar, как у панели задач).
+    // Регистрируется, только пока видимый док стоит вместо панели задач (правила — AppBarRules в Habits.cs). Где она
+    // сейчас — записано в файл рядом с настройками: если док упал так, что не успел её отдать, следующий запуск
+    // отдаёт её за него. При выходе, при необработанной ошибке и при завершении сеанса она отдаётся сразу (Program.cs).
+    static class AppBar
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct APPBARDATA { public int Size; public IntPtr Hwnd; public uint Callback, Edge; public int L, T, R, B; public IntPtr Param; }
+        [DllImport("shell32.dll")] static extern IntPtr SHAppBarMessage(uint msg, ref APPBARDATA data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+
+        const uint ABM_NEW = 0, ABM_REMOVE = 1, ABM_QUERYPOS = 2, ABM_SETPOS = 3, ABM_WINDOWPOSCHANGED = 9, ABE_BOTTOM = 3;
+        public const int ABN_POSCHANGED = 1, ABN_FULLSCREENAPP = 2;
+
+        // Этим сообщением Windows говорит доку, что полосы на краях экрана сдвинулись или что впереди окно на весь экран
+        public static readonly uint Callback = RegisterWindowMessage("devtxt_dock_appbar");
+
+        static readonly object gate = new object();
+        static IntPtr owner;
+        static bool registered, dirty = true;
+        static PxRect band, monitorWas;
+        static int heightWas;
+        static string markerDir;
+
+        public static bool Registered { get { return registered; } }
+        public static PxRect Band { get { return band; } }
+
+        static string Marker(string dir) { return dir == null ? null : Path.Combine(dir, "appbar.txt"); }
+
+        static APPBARDATA Data(IntPtr hwnd)
+        {
+            return new APPBARDATA { Size = Marshal.SizeOf(typeof(APPBARDATA)), Hwnd = hwnd, Callback = Callback, Edge = ABE_BOTTOM };
+        }
+
+        // Полосы на краях сдвинулись (ABN_POSCHANGED), сменился экран: в следующий раз спросить Windows заново
+        public static void Dirty() { dirty = true; }
+
+        // Проводник перезапустился — он забыл все полосы: зарегистрироваться заново
+        public static void Lost() { lock (gate) { registered = false; dirty = true; } }
+
+        // Привести к нужному: want — занимать ли место, monitor — главный монитор, height — высота полосы (точки экрана).
+        // true — полоса появилась, ушла или сдвинулась: док ставится заново. Одно и то же второй раз Windows не передаётся.
+        public static bool Sync(IntPtr hwnd, string dir, bool want, PxRect monitor, int height)
+        {
+            lock (gate)
+            {
+                if (!want || hwnd == IntPtr.Zero || height <= 0) return RemoveLocked();
+                if (registered && owner != hwnd) RemoveLocked();
+                if (registered && !dirty && height == heightWas && monitor.Same(monitorWas)) return false;
+                bool fresh = !registered;
+                if (fresh)
+                {
+                    APPBARDATA n = Data(hwnd);
+                    SHAppBarMessage(ABM_NEW, ref n);   // false — окно уже зарегистрировано: тоже годится
+                    registered = true;
+                    owner = hwnd;
+                    markerDir = dir;
+                    try { string f = Marker(dir); if (f != null) { Directory.CreateDirectory(dir); File.WriteAllText(f, hwnd.ToInt64().ToString()); } } catch { }
+                }
+                dirty = false;
+                heightWas = height; monitorWas = monitor;
+                PxRect ask = AppBarRules.Propose(monitor, height);
+                APPBARDATA q = Data(hwnd);
+                q.L = ask.L; q.T = ask.T; q.R = ask.R; q.B = ask.B;
+                SHAppBarMessage(ABM_QUERYPOS, ref q);
+                PxRect settled = AppBarRules.Settle(new PxRect(q.L, q.T, q.R, q.B), monitor, height);
+                if (!fresh && settled.Same(band)) return false;
+                APPBARDATA s = Data(hwnd);
+                s.L = settled.L; s.T = settled.T; s.R = settled.R; s.B = settled.B;
+                SHAppBarMessage(ABM_SETPOS, ref s);
+                band = new PxRect(s.L, s.T, s.R, s.B);
+                return true;
+            }
+        }
+
+        // Окно дока сдвинулось — так просит Windows (для полос с автоскрытием это важно, нашей — просто вежливость)
+        public static void Moved()
+        {
+            lock (gate)
+            {
+                if (!registered) return;
+                APPBARDATA d = Data(owner);
+                SHAppBarMessage(ABM_WINDOWPOSCHANGED, ref d);
+            }
+        }
+
+        // Отдать место. Зовётся и из чужого потока (необработанная ошибка), поэтому под замком.
+        public static bool Remove() { lock (gate) return RemoveLocked(); }
+
+        static bool RemoveLocked()
+        {
+            if (!registered) return false;
+            APPBARDATA d = Data(owner);
+            try { SHAppBarMessage(ABM_REMOVE, ref d); } catch { }
+            registered = false;
+            dirty = true;
+            band = new PxRect();
+            try { string f = Marker(markerDir); if (f != null && File.Exists(f)) File.Delete(f); } catch { }
+            return true;
+        }
+
+        // Прошлый запуск не отдал место (его закрыли силой): отдаём за него. Окно с тем номером живо — это уже чужое
+        // окно (номера окон Windows раздаёт заново), его полосу не трогаем.
+        public static void Recover(string dir)
+        {
+            string f = Marker(dir);
+            try
+            {
+                long v;
+                if (f == null || !File.Exists(f)) return;
+                if (long.TryParse(File.ReadAllText(f).Trim(), out v) && v != 0)
+                {
+                    IntPtr old = new IntPtr(v);
+                    if (!IsWindow(old))
+                    {
+                        APPBARDATA d = Data(old);
+                        SHAppBarMessage(ABM_REMOVE, ref d);
+                    }
+                }
+                File.Delete(f);
+            }
+            catch { }
+        }
+    }
+
     // Кнопка Windows открывает меню приложений дока вместо «Пуска». Сочетания с ней (Win+E, Win+D, Win+L…) работают как
-    // обычно: перехватывается только одиночное нажатие. Перехватчик живёт в своём потоке и делает самое малое.
+    // обычно: перехватывается только одиночное нажатие — и Win+1…9, которые ведут к закреплённому в доке приложению
+    // (как у панели задач Windows). Перехватчик живёт в своём потоке и делает самое малое.
     static class WinKey
     {
         delegate IntPtr Proc(int code, IntPtr w, IntPtr l);
@@ -242,15 +370,25 @@ namespace DevTxt.DockApp
         static volatile bool enabled;   // false — перехватчик ещё стоит (его поток заканчивает работу), но уже ничего не делает
         static Dispatcher ui;
         static Action pressed;
+        static Action<int> digitPressed;
         static bool winDown, other;
+        static int digit;               // цифра, нажатие которой мы забрали у Windows (0 — никакой): её отпускание тоже наше
+        static volatile bool menuOn, digitsOn;
         static readonly int[] mouseButtons = { 1, 2, 4, 5, 6 };   // левая, правая, средняя и две боковые кнопки мыши
 
-        public static bool Installed { get { return enabled && handle != IntPtr.Zero; } }
+        // Впереди игра или видео на весь экран (так решил док): Win+цифра остаётся игре и Windows, док её не забирает
+        public static volatile bool Game;
 
-        public static void Sync(bool wanted, Dispatcher dispatcher, Action onPress)
+        public static bool Installed { get { return enabled && handle != IntPtr.Zero; } }
+        public static bool Digits { get { return Installed && digitsOn; } }
+
+        // menu — одиночное нажатие открывает меню дока; digits — Win+1…9 ведут к закреплённым в доке.
+        // Перехватчик стоит, пока нужно хоть одно из двух.
+        public static void Sync(bool menu, bool digits, Dispatcher dispatcher, Action onPress, Action<int> onDigit)
         {
-            ui = dispatcher; pressed = onPress;
-            if (wanted) Start(); else Stop();
+            ui = dispatcher; pressed = onPress; digitPressed = onDigit;
+            menuOn = menu; digitsOn = digits;
+            if (menu || digits) Start(); else Stop();
         }
 
         static void Start()
@@ -310,6 +448,7 @@ namespace DevTxt.DockApp
                 thread = null;
                 threadId = 0;
                 winDown = false;
+                digit = 0;
             }
         }
 
@@ -341,6 +480,8 @@ namespace DevTxt.DockApp
             return used;
         }
 
+        static bool Held(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
         static IntPtr Callback(int code, IntPtr w, IntPtr l)
         {
             try
@@ -351,11 +492,33 @@ namespace DevTxt.DockApp
                     bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
                     bool win = vk == LWin || vk == RWin;
                     if (win && down) { if (!winDown) { winDown = true; other = false; MouseUsed(true); } }
-                    else if (down) { if (winDown) other = true; }
+                    else if (down)
+                    {
+                        if (winDown)
+                        {
+                            other = true;
+                            // Win+цифра: до Windows цифра не доходит — двойного действия нет (её панель задач спрятана, но
+                            // сочетание всё равно слушает). Чтобы отпускание кнопки Windows не открыло «Пуск», Windows видит
+                            // вместо цифры несуществующую клавишу. Повтор клавиши, пока её держат, — не новое нажатие.
+                            int index = digitsOn && !Game ? WinDigit.Index(vk, Held(0x10), Held(0x11), Held(0x12)) : -1;
+                            if (index >= 0)
+                            {
+                                if (digit != vk)
+                                {
+                                    digit = vk;
+                                    SendInput(2, new INPUT[] { Key(Mask, false), Key(Mask, true) }, Marshal.SizeOf(typeof(INPUT)));
+                                    Action<int> act = digitPressed;
+                                    if (ui != null && act != null) ui.BeginInvoke(DispatcherPriority.Send, act, index);
+                                }
+                                return new IntPtr(1);
+                            }
+                        }
+                    }
+                    else if (!win && digit != 0 && vk == digit) { digit = 0; return new IntPtr(1); }   // отпустили забранную цифру
                     else if (win && winDown)
                     {
                         winDown = false;
-                        if (!other)
+                        if (!other && menuOn)
                         {
                             // Одиночное нажатие: перед отпусканием — несуществующая клавиша, тогда Windows считает,
                             // что кнопку нажимали «с чем-то», и «Пуск» не открывает. Само отпускание посылаем от себя.

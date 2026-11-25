@@ -291,7 +291,7 @@ namespace DevTxt.DockApp
     // с экрана из-за игры и когда счётчику можно выскочить. Здесь только правила; в хаб их отдаёт DockHub.
     static class FamilyRules
     {
-        public const string TrayAutoHide = "autoHide", TraySettings = "settings", KeyApps = "winKey";
+        public const string TrayAutoHide = "autoHide", TraySettings = "settings", KeyApps = "winKey", KeyDigits = "winDigits";
         // Страница дока в core.txt: команда show через хаб и ключ --page, если core.txt приходится запускать
         public const string CorePage = "app:dock";
         // Столько миллисекунд после смены окна впереди док при core.txt уходит и по своей проверке: core.txt мог ещё не сказать
@@ -309,11 +309,16 @@ namespace DevTxt.DockApp
             };
         }
 
-        // Сочетания дока: одиночное нажатие кнопки Windows открывает меню приложений. Действует, только когда
-        // dock.txt стоит вместо панели задач и в настройках это включено (так же решает WinKey.Sync).
+        // Сочетания дока: одиночное нажатие кнопки Windows открывает меню приложений — только когда dock.txt стоит вместо
+        // панели задач и в настройках это включено; Win+1…9 — закреплённое в доке по номеру, пока dock.txt стоит вместо
+        // панели задач (как у неё самой). Так же решает WinKey.Sync.
         public static List<KeyInfo> Keys(bool replaceTaskbar, bool winKey)
         {
-            return new List<KeyInfo> { new KeyInfo(KeyApps, "Меню приложений", KeyNames.Text(0, 0x5B), replaceTaskbar && winKey) };
+            return new List<KeyInfo>
+            {
+                new KeyInfo(KeyApps, "Меню приложений", KeyNames.Text(0, 0x5B), replaceTaskbar && winKey),
+                new KeyInfo(KeyDigits, "Закреплённое приложение по номеру", "Win+1…9", replaceTaskbar)
+            };
         }
 
         // Уходить ли доку с экрана: впереди игра или видео на весь экран. coreOnline — core.txt на связи и прислал

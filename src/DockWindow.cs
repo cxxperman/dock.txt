@@ -60,11 +60,13 @@ namespace DevTxt.DockApp
         internal static readonly string[] DockSprite = { "....####....", "....#E##....", ".##.#E##.##.", ".##.####.##.", ".##.####.##.", "............", "############", ".##########." };
 
         // Свои размеры дока — то, чего в токенах нет
-        const double PadH = 6, PadTop = 9, DotZone = 12, EdgeGap = 8, TipGap = 9, TipH = 26, TopRoom = 12, DotSize = 4, DotWide = 14;
+        const double PadH = 6, PadTop = 9, DotZone = 12, EdgeGap = 8, TipGap = 9, TipH = 26, TopRoom = 12, DotSize = 4, DotWide = 14, DotAsking = 8;
         const double WidgetTipGap = 5, TipMaxH = 92;   // подпись виджета бывает в несколько строк (события календаря)
         const double MusicText = 180, CalendarText = 190, MusicTextTight = 110, CalendarTextTight = 120;
         internal const double MaxScale = 1.55, RangeSlots = 2.6;
         const int HideAfterMs = 700, EdgeMs = 50, SlowPollTicks = 5;
+        // Окна док перечитывает по сообщениям Windows (ShellBatch); на случай, если какое-то потерялось, — ещё и раз в 12 с
+        const int FallbackMs = 12000;
         // Движение: появление и переезд значков, уход, нажатие (вниз быстро, обратно мягко), прыжок при запуске, виджеты
         const int AppearMs = 250, LeaveMs = 180, PressDownMs = 70, PressUpMs = 220, BounceMs = 560, BounceCycles = 3, WidgetFadeMs = 120;
         const double PressScale = 0.92, BounceHeight = 0.2;
@@ -77,8 +79,10 @@ namespace DevTxt.DockApp
         // Стекло: системный акрил в подложке и полупрозрачный тёмный фон самой полосы поверх него — белые подписи
         // читаются и на белых обоях, а сквозь полосу видно, что позади
         const double PanelTint = 0.45;
-        const int WM_SETTINGCHANGE = 0x1A, WM_DISPLAYCHANGE = 0x7E, WM_DPICHANGED = 0x2E0;
+        const int WM_SETTINGCHANGE = 0x1A, WM_DISPLAYCHANGE = 0x7E, WM_DPICHANGED = 0x2E0, WM_WINDOWPOSCHANGED = 0x47, SPI_SETWORKAREA = 0x2F;
         static readonly Brush solidFill = Ui.Solid(Tokens.Dark.Bg), glassFill = Ui.Solid(Ui.Alpha(Tokens.Dark.Bg, PanelTint));
+        // Точка «просит внимания» — оранжевая, как кнопка такого окна на панели задач Windows
+        static readonly Brush askingDot = Ui.Solid(Tokens.Palette.Orange);
         GlassBackdrop glass;   // null — размытия нет: Windows 10, снимок, без окна
         bool glassOn;          // размытие сейчас включено («Эффекты прозрачности» Windows не выключены)
         readonly Grid shadowBox;
@@ -144,9 +148,20 @@ namespace DevTxt.DockApp
         // Увеличение: одна пружина от 0 (покой) до 1 (курсор над доком). Сами значки идут за курсором без задержки.
         double amount, velocity, cursorU, lastU = double.NaN, lastAmount = double.NaN;
         bool looping, inside, menuOpen, hidden, fullscreen, away, moving;
-        int hover = -1, edgeHits;
+        int hover = -1;
         long lastFrame, lastInside, lastSwitch = -1;   // lastSwitch — когда впереди сменилось окно (−1 — ещё не менялось)
         string tipOverride;
+
+        // По привычкам Windows (Habits.cs): появление от края, сообщения об окнах, «просит внимания», файлы на значке
+        readonly EdgeReveal edgeRule = new EdgeReveal();
+        readonly ShellBatch shellBatch = new ShellBatch();
+        readonly Attention attention = new Attention();
+        readonly DispatcherTimer shellTimer = new DispatcherTimer();
+        IntPtr me;            // окно дока у Windows (нет — пока окно не создано, и без окна)
+        bool shellOn;         // Windows присылает сообщения об окнах
+        long lastCollect;     // когда окна перечитывались в последний раз
+        bool dotsLater;       // прыжки «просит внимания» кончились — точке пора стать оранжевой
+        Slot dropFor;         // над каким значком несут файлы, чтобы открыть их этой программой
 
         // hubData — для --demo: показывать ли выдуманные музыку, погоду, календарь и счётчики
         public DockWindow(bool demo, Store store, bool headless, bool hubData)
@@ -212,12 +227,13 @@ namespace DevTxt.DockApp
             strip.MouseLeave += delegate { Release(); };
             strip.MouseMove += StripMove;
             strip.LostMouseCapture += delegate { armed = null; if (drag != null) CancelDrag(); };
-            // Файлы и папки из проводника принимает только бак; остальные значки на перетаскивание не отвечают, как и раньше
+            // Файлы и папки из проводника: на бак — в корзину, на значок программы — открыть ею; остальное их не принимает
             strip.AllowDrop = true;
-            strip.DragEnter += BinDragOver;
-            strip.DragOver += BinDragOver;
-            strip.DragLeave += delegate(object s, DragEventArgs e) { e.Handled = true; SetBinDropHot(false); };
-            strip.Drop += BinDrop;
+            strip.DragEnter += FilesOver;
+            strip.DragOver += FilesOver;
+            strip.DragLeave += delegate(object s, DragEventArgs e) { e.Handled = true; SetBinDropHot(false); SetDropFor(null); };
+            strip.Drop += FilesDropped;
+            shellTimer.Tick += delegate { shellTimer.Stop(); ShellFlush(); };
             previewOpen.Tick += delegate { previewOpen.Stop(); PreviewDue(); };
             previewShut.Tick += delegate { previewShut.Stop(); PreviewLeft(); };
             previewPoll.Tick += delegate
@@ -235,7 +251,7 @@ namespace DevTxt.DockApp
             };
             SourceInitialized += delegate
             {
-                IntPtr me = new WindowInteropHelper(this).Handle;
+                me = new WindowInteropHelper(this).Handle;
                 Win.MakeBar(me);
                 // Окно появляется на экране — только у настоящего окна (не в снимке и не без окна): тогда и подложка
                 // для размытия. Она владелец окна дока, поэтому док всегда стоит прямо над ней.
@@ -251,13 +267,34 @@ namespace DevTxt.DockApp
                 ApplyGlass();
                 HwndSource.FromHwnd(me).AddHook(delegate(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled)
                 {
-                    // Проводник перезапустился и снова показал свою панель задач — прячем её заново
-                    if (msg == TaskbarSwap.TaskbarCreated && msg != 0) Dispatcher.BeginInvoke(new Action(SyncTaskbar));
-                    // Переключили «Эффекты прозрачности» (и другие общие настройки) — смотрим, нужно ли размытие
-                    else if (msg == WM_SETTINGCHANGE) Dispatcher.BeginInvoke(new Action(ApplyGlass));
-                    else if (msg == WM_DPICHANGED || msg == WM_DISPLAYCHANGE) Dispatcher.BeginInvoke(new Action(SyncGlass));
+                    uint m = (uint)msg;
+                    // Сообщения Windows об окнах: копятся в пачку и разбираются разом
+                    if (shellOn && m == Win.ShellMessage) { OnShell(w.ToInt32(), l); return IntPtr.Zero; }
+                    // Полосы на краях экрана сдвинулись — встаём заново; впереди окно на весь экран — смотрим, не игра ли
+                    if (m == AppBar.Callback && m != 0)
+                    {
+                        int code = w.ToInt32();
+                        if (code == AppBar.ABN_POSCHANGED) { AppBar.Dirty(); Dispatcher.BeginInvoke(new Action(Rebuild)); }
+                        else if (code == AppBar.ABN_FULLSCREENAPP) Dispatcher.BeginInvoke(new Action(SyncGame));
+                        return IntPtr.Zero;
+                    }
+                    // Проводник перезапустился и снова показал свою панель задач — прячем её заново; полосу дока он забыл
+                    if (m == TaskbarSwap.TaskbarCreated && msg != 0) { AppBar.Lost(); Dispatcher.BeginInvoke(new Action(delegate { SyncTaskbar(); Rebuild(); })); }
+                    // Переключили «Эффекты прозрачности» (и другие общие настройки) — смотрим, нужно ли размытие;
+                    // рабочая область экрана сменилась — док встаёт заново (чуть позже: пусть WPF сначала узнает её сам)
+                    else if (msg == WM_SETTINGCHANGE)
+                    {
+                        Dispatcher.BeginInvoke(new Action(ApplyGlass));
+                        if (w.ToInt32() == SPI_SETWORKAREA) Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(WorkAreaChanged));
+                    }
+                    else if (msg == WM_DPICHANGED || msg == WM_DISPLAYCHANGE) { AppBar.Dirty(); Dispatcher.BeginInvoke(new Action(delegate { Rebuild(); SyncGlass(); })); }
+                    else if (msg == WM_WINDOWPOSCHANGED) AppBar.Moved();
                     return IntPtr.Zero;
                 });
+                // Сообщения об окнах — только у настоящего дока; без них (не вышло) окна перечитываются, как раньше, по таймеру
+                if (!demo && !headless) shellOn = Win.WatchShell(me);
+                // Окно есть — можно занять своё место у Windows и встать в него
+                if (!demo && !headless) Dispatcher.BeginInvoke(new Action(Rebuild));
             };
             // Окно дока спрятали (игра, панель Windows) или показали — подложка вместе с ним
             IsVisibleChanged += delegate { SyncGlass(); };
@@ -285,7 +322,8 @@ namespace DevTxt.DockApp
                 });
                 ReadVolume();
                 battery = Power.Read();
-                refresh.Tick += delegate { Refresh(); };
+                lastCollect = clock.ElapsedMilliseconds;
+                refresh.Tick += delegate { Tick(); };
                 refresh.Start();
                 edge.Tick += delegate { EdgeTick(); };
                 minute.Tick += delegate { MinuteTick(); };
@@ -319,15 +357,32 @@ namespace DevTxt.DockApp
             Rebuild();
         }
 
+        // Для снимков (--demo --asking N): окно значка N просит внимания. В снимке ничего не движется — сразу оранжевая точка.
+        internal void DemoAsk(int n)
+        {
+            if (!demo || n < 0 || n >= items.Count || !items[n].Running) return;
+            attention.Flash(items[n].Windows[items[n].Windows.Count - 1], IntPtr.Zero, clock.ElapsedMilliseconds);
+            SyncDots();
+            Place(true);
+        }
+
         readonly DispatcherTimer taskbarTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         readonly DispatcherTimer hookTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
 
-        // Панель задач Windows и кнопка Windows — по настройкам
+        // Панель задач Windows, своё место дока и кнопка Windows — по настройкам. Место отдаётся раньше, чем возвращается
+        // панель Windows: она сразу встаёт туда, где была, а не над полосой дока.
         void SyncTaskbar()
         {
             if (demo || headless) return;
-            if (store.ReplaceTaskbar) TaskbarSwap.Take(store.Dir); else TaskbarSwap.Give(store.Dir);
-            WinKey.Sync(store.ReplaceTaskbar && store.WinKey, Dispatcher, WinPressed);
+            if (store.ReplaceTaskbar) TaskbarSwap.Take(store.Dir);
+            else
+            {
+                if (AppBar.Remove()) Rebuild();
+                TaskbarSwap.Give(store.Dir);
+            }
+            // Панель Windows спряталась — её место освободилось: полоса дока опускается к самому краю
+            if (store.ReplaceTaskbar) { AppBar.Dirty(); Rebuild(); }
+            WinKey.Sync(store.ReplaceTaskbar && store.WinKey, store.ReplaceTaskbar, Dispatcher, WinPressed, WinDigitPressed);
             // Компактная панель Windows: включаем, только когда её выбрали; иначе возвращаем, как было до нас
             bool changed = store.Bar == "modern" ? TaskbarSwap.CompactOn(store.Dir) : TaskbarSwap.CompactBack(store.Dir);
             if (changed) TaskbarSwap.RestartExplorer(null);   // Проводник не закрылся сам — не трогаем: панель сменится при следующем входе
@@ -346,19 +401,43 @@ namespace DevTxt.DockApp
             ToggleApps();
         }
 
+        // Win+1…9: закреплённое приложение с этим номером — как щелчок по его значку. Перехватчик уже не пустил цифру
+        // в Windows; поверх игры он её и не берёт, а если игра вышла вперёд только что, здесь — ещё одна проверка: фокус
+        // остаётся у игры. Окна перечитываются тут же: порядок «следующего окна» должен быть свежим.
+        void WinDigitPressed(int index)
+        {
+            if (ended || demo) return;
+            if (away || FullScreen.Ahead()) return;
+            Refresh();
+            DockItem item;
+            Click what;
+            IntPtr target;
+            if (!WinDigit.Decide(items, index, Win.Foreground(), out item, out what, out target)) return;
+            Slot slot = Find("item:" + item.Key);
+            try
+            {
+                if (what == Click.Launch) { Shell.Launch(item); if (slot != null) Bounce(slot); }
+                else if (what == Click.Minimize) Win.Minimize(target);
+                else Win.Activate(target);
+            }
+            catch { }   // программа не запустилась — как и у «Пуска», ничего не происходит
+        }
+
         // Всё, что тикает и слушает, останавливается один раз
         void End()
         {
             if (ended) return;
             ended = true;
-            refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop();
+            refresh.Stop(); edge.Stop(); minute.Stop(); taskbarTimer.Stop(); hookTimer.Stop(); shellTimer.Stop();
             previewOpen.Stop(); previewShut.Stop(); previewPoll.Stop();
             if (preview != null) { try { preview.Close(); } catch { } preview = null; }
             StopLoop();
             if (glass != null) glass.Hide();
             Win.Unwatch();
-            // Док уходит — панель задач и кнопка Windows возвращаются такими, какими были
+            if (shellOn) { Win.UnwatchShell(me); shellOn = false; }
+            // Док уходит — его место у Windows освобождается, панель задач и кнопка Windows возвращаются такими, какими были
             WinKey.Stop();
+            AppBar.Remove();
             if (!demo && !headless) TaskbarSwap.Give(store.Dir);
             if (audio != null) audio.Close();
             if (hub != null) hub.Stop();
@@ -380,11 +459,13 @@ namespace DevTxt.DockApp
             return Logic.Group(store.Pins, Win.Taskbar(), store.ShowRunning, Shell.NameOf);
         }
 
-        // Раз в секунду (и сразу, когда впереди стало другое окно): смотрим на окна и меняем док, только если что-то изменилось.
-        // Раз в пять секунд заодно — батарея и не сменилось ли устройство звука.
-        void Refresh()
+        // Раз в секунду — только то, что дёшево: не вышла ли вперёд игра (без core.txt — своя проверка одного окна впереди),
+        // какое окно впереди. Раз в пять секунд — батарея и не сменилось ли устройство звука. Сами окна перечитываются по
+        // сообщениям Windows (OnShell), а раз в 12 с — на всякий случай; без этих сообщений — каждую секунду, как раньше.
+        void Tick()
         {
             SyncGame();
+            IntPtr was = fg;
             fg = Win.Foreground();
             if (++ticks % SlowPollTicks == 0)
             {
@@ -397,7 +478,31 @@ namespace DevTxt.DockApp
                 bool metla = BinRules.MetlaInstalled;
                 if (metla != binInstalled) { binInstalled = metla; widgetsDirty = true; }
             }
+            bool due = !shellOn || clock.ElapsedMilliseconds - lastCollect >= FallbackMs;
+            if (due || widgetsDirty || SystemParameters.WorkArea != work) { Refresh(); return; }
+            if (fg != was) { attention.Clear(fg); SyncDots(); }
+        }
+
+        // Рабочая область экрана сменилась (своя полоса заняла место или отдала его, сменили разрешение)
+        void WorkAreaChanged()
+        {
+            if (ended || demo) return;
+            if (SystemParameters.WorkArea != work) Refresh();
+        }
+
+        // Перечитать окна и поменять док, только если что-то изменилось. По сообщению Windows, на всякий случай раз в 12 с,
+        // перед Win+цифрой, пока над значком открыта панель с окнами.
+        void Refresh()
+        {
+            SyncGame();
+            fg = Win.Foreground();
+            lastCollect = clock.ElapsedMilliseconds;
             var now = Collect();
+            // Окон, которых больше нет, просьбы о внимании тоже нет
+            var alive = new HashSet<IntPtr>();
+            foreach (DockItem i in now) foreach (IntPtr h in i.Windows) alive.Add(h);
+            attention.Keep(delegate(IntPtr h) { return alive.Contains(h); });
+            attention.Clear(fg);
             bool moved = SystemParameters.WorkArea != work;   // сменили разрешение или передвинули панель задач
             if (moved) work = SystemParameters.WorkArea;
             if (moved || widgetsDirty || Logic.Signature(now) != signature)
@@ -419,12 +524,90 @@ namespace DevTxt.DockApp
             SyncPreview();
         }
 
+        // Впереди стало другое окно: игра, точка под значком, просьба о внимании — сразу. Порядок окон перечитается по
+        // сообщению Windows об этом же (HSHELL_WINDOWACTIVATED); если их нет — перечитываем сами, как раньше.
         void ForegroundChanged()
         {
             lastSwitch = clock.ElapsedMilliseconds;
             if (fgPending || ended) return;
             fgPending = true;
-            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate { fgPending = false; if (!ended) Refresh(); }));
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+            {
+                fgPending = false;
+                if (ended) return;
+                if (!shellOn) { Refresh(); return; }
+                SyncGame();
+                fg = Win.Foreground();
+                attention.Clear(fg);
+                SyncDots();
+            }));
+        }
+
+        // ───────── Сообщения Windows об окнах ─────────
+        // Приходят по одному, разбираются пачкой: срок пачки только приближается (ShellBatch)
+        void OnShell(int code, IntPtr hwnd)
+        {
+            if (ended) return;
+            long now = clock.ElapsedMilliseconds;
+            bool waiting = shellBatch.Pending;
+            long was = shellBatch.Due;
+            long due = shellBatch.Add(code, hwnd, now);
+            if (due < 0 || (waiting && due >= was && shellTimer.IsEnabled)) return;
+            shellTimer.Stop();
+            shellTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, due - now));
+            shellTimer.Start();
+        }
+
+        void ShellFlush()
+        {
+            if (ended) return;
+            ShellSummary s = shellBatch.Take();
+            if (s.Windows) Refresh();
+            else if (s.Titles) SyncPreview();   // сменились только заголовки: они видны лишь в панели с окнами
+            long now = clock.ElapsedMilliseconds;
+            IntPtr ahead = Win.Foreground();
+            var fresh = new List<IntPtr>();
+            foreach (var a in s.Attention)
+            {
+                if (a.Value) { if (attention.Flash(a.Key, ahead, now)) fresh.Add(a.Key); }
+                else { attention.Clear(a.Key); fresh.Remove(a.Key); }
+            }
+            foreach (IntPtr h in fresh) AskFor(h, now);
+            SyncDots();
+        }
+
+        // Окно попросило внимания: его значок подпрыгивает (три раза), потом под ним оранжевая точка
+        void AskFor(IntPtr hwnd, long at)
+        {
+            Slot s = slots.Find(delegate(Slot x) { return x.Kind == SlotKind.Item && !x.Leaving && x.Item != null && x.Item.Windows.Contains(hwnd); });
+            if (s == null || AttentionStill) return;
+            s.BounceAt = at;
+            s.BounceStop = Attention.Hops;   // окно у программы уже есть — прыгаем все три раза, а не до первого окна
+            StartLoop();
+        }
+
+        // Без прыжков: «Меньше движения», «Не беспокоить» в core.txt или окна на экране нет
+        bool AttentionStill { get { return Ui.ReducedMotion || Quiet || !CanAnimate; } }
+
+        AttentionPhase PhaseOf(DockItem item)
+        {
+            return Attention.Phase(attention.Since(item), clock.ElapsedMilliseconds, AttentionStill, BounceMs);
+        }
+
+        // Для проверок (--testhook, команда test.shell): будто Windows прислала сообщение об окне программы app
+        // (по названию; без него — первая запущенная, чьё окно сейчас не впереди). Ответ — какая программа и окно.
+        internal Dictionary<string, object> TestShell(string ev, string app)
+        {
+            int code = ev == "flash" ? ShellCodes.Flash : ev == "activated" ? ShellCodes.Activated : ev == "destroyed" ? ShellCodes.Destroyed : ev == "created" ? ShellCodes.Created : 0;
+            if (code == 0) throw new Exception("такого сообщения нет: flash, activated, destroyed или created");
+            IntPtr ahead = Win.Foreground();
+            DockItem item = items.Find(delegate(DockItem i)
+            {
+                return i.Running && (string.IsNullOrEmpty(app) ? !i.Windows.Contains(ahead) : string.Equals(i.Name, app, StringComparison.OrdinalIgnoreCase));
+            });
+            if (item == null) throw new Exception("нет такой запущенной программы в доке");
+            OnShell(code, item.Windows[0]);
+            return HubLink.Msg("name", item.Name, "hwnd", item.Windows[0].ToInt64());
         }
 
         // Часы идут раз в минуту, ровно на её границе
@@ -518,6 +701,7 @@ namespace DevTxt.DockApp
         void SyncGame()
         {
             bool full = GameNow();
+            WinKey.Game = full;   // в игре Win+цифра остаётся игре
             if (full == fullscreen) return;
             fullscreen = full;
             SyncAway();
@@ -550,7 +734,66 @@ namespace DevTxt.DockApp
         {
             return HubLink.Msg("fullscreen", fullscreen, "away", away, "local", FullScreen.Ahead(), "screen", Win.OnDockScreen(Win.Foreground()),
                 "coreOnline", hub != null && hub.CoreOnline, "coreGame", hub != null && hub.Game, "quiet", Quiet,
-                "autoHide", store.AutoHide, "taskbarTaken", TaskbarSwap.Active, "winKeyHooked", WinKey.Installed, "bin", BinState());
+                "autoHide", store.AutoHide, "taskbarTaken", TaskbarSwap.Active, "winKeyHooked", WinKey.Installed, "winDigits", WinKey.Digits, "bin", BinState(),
+                "appBar", AppBarState(), "edgeDwellMs", EdgeReveal.DwellMs, "shellHook", shellOn, "fallbackMs", FallbackMs, "attention", AttentionState());
+        }
+
+        // Для test.state: занял бы док место у Windows (wanted — будь он на экране), занял ли (без окна — никогда), сколько
+        double Scale
+        {
+            get
+            {
+                PresentationSource src = PresentationSource.FromVisual(this);
+                if (src != null && src.CompositionTarget != null) return src.CompositionTarget.TransformToDevice.M22;
+                return Win.SystemScale();
+            }
+        }
+
+        // Высота дока в покое, в точках WPF: от верха полосы до края экрана (поле под полосой тоже его)
+        double RestDip { get { return EdgeGap + PadTop + size + DotZone; } }
+
+        Dictionary<string, object> AppBarState()
+        {
+            PxRect mon;
+            bool known = Win.PrimaryMonitor(out mon);
+            int h = AppBarRules.Height(RestDip, Scale);
+            PxRect r = AppBar.Registered ? AppBar.Band : AppBarRules.Propose(mon, h);
+            return HubLink.Msg("wanted", known && AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide), "registered", AppBar.Registered,
+                "height", h, "restDip", RestDip, "scale", Scale, "rect", new object[] { r.L, r.T, r.R, r.B });
+        }
+
+        object[] AttentionState()
+        {
+            var list = new List<object>();
+            foreach (DockItem i in items)
+            {
+                AttentionPhase ph = PhaseOf(i);
+                if (ph != AttentionPhase.None) list.Add(HubLink.Msg("name", i.Name, "phase", ph == AttentionPhase.Bounce ? "bounce" : "mark"));
+            }
+            return list.ToArray();
+        }
+
+        // Занять своё место у Windows или отдать его — по настройкам. true — полоса появилась, ушла или сдвинулась.
+        bool SyncAppBar()
+        {
+            if (demo || headless || me == IntPtr.Zero || ended) return false;
+            PxRect mon;
+            bool want = AppBarRules.Wanted(true, store.ReplaceTaskbar, store.AutoHide) && Win.PrimaryMonitor(out mon);
+            if (!want) return AppBar.Sync(me, store.Dir, false, new PxRect(), 0);
+            Win.PrimaryMonitor(out mon);
+            return AppBar.Sync(me, store.Dir, true, mon, AppBarRules.Height(RestDip, Scale));
+        }
+
+        // Где стоит док: рабочая область главного монитора, а пока он занял своё место — по низу этого места
+        // (рабочая область тогда кончается над ним)
+        Rect Area
+        {
+            get
+            {
+                if (!AppBar.Registered) return work;
+                double bottom = AppBarRules.BottomDip(AppBar.Band, Scale);
+                return new Rect(work.Left, work.Top, work.Width, Math.Max(0, bottom - work.Top));
+            }
         }
 
         // ───────── Корзина ─────────
@@ -621,15 +864,30 @@ namespace DevTxt.DockApp
             return slot;
         }
 
-        // Файлы над доком: над баком — крышка приподнята и курсор «Переместить», над остальным — нельзя
-        void BinDragOver(object sender, DragEventArgs e)
+        // Файлы над доком: над баком — крышка приподнята и курсор «Переместить»; над значком обычной программы — курсор
+        // «Копировать» и подпись «Открыть в …»; над остальным — нельзя
+        void FilesOver(object sender, DragEventArgs e)
         {
             e.Handled = true;
             Slot at = SlotAt(e.GetPosition(this).X);
-            bool hot = at != null && at.Kind == SlotKind.Bin && !at.Leaving && e.Data.GetDataPresent(DataFormats.FileDrop);
-            e.Effects = hot ? DragDropEffects.Move : DragDropEffects.None;
+            bool files = at != null && !at.Leaving && e.Data.GetDataPresent(DataFormats.FileDrop);
+            bool hot = files && at.Kind == SlotKind.Bin;
+            bool open = files && at.Kind == SlotKind.Item && !demo && OpenWith.Accepts(at.Item, System.IO.File.Exists);
+            e.Effects = hot ? DragDropEffects.Move : open ? DragDropEffects.Copy : DragDropEffects.None;
             SetBinDropHot(hot);
+            SetDropFor(open ? at : null);
             StartLoop();   // кнопка мыши у проводника: движения мыши док не получает, кадры идут сами — бак растёт под курсором
+        }
+
+        // Подпись над значком, на который несут файлы: «Открыть в «Блокнот»»
+        void SetDropFor(Slot s)
+        {
+            if (s == dropFor) return;
+            dropFor = s;
+            int at = s == null ? -1 : slots.IndexOf(s);
+            if (at >= 0 && hover != at) SetHover(at);
+            tipOverride = s != null && s.Item != null ? OpenWith.Tip(s.Item.Name) : null;
+            if (hover >= 0) ShowTip();
         }
 
         void SetBinDropHot(bool hot)
@@ -643,7 +901,36 @@ namespace DevTxt.DockApp
         // Бросили на бак: в корзину Windows с возможностью восстановить. Проводнику отвечаем «ничего не сделано» (None):
         // при «Переместить» он мог бы сам удалить исходные файлы — а их уже кладёт в корзину сама Windows по нашей просьбе.
         // Сама просьба — после того, как проводник отпустил перетаскивание, чтобы его окно не ждало вопроса Windows.
-        void BinDrop(object sender, DragEventArgs e)
+        // Бросили на значок программы — она открывает эти файлы (запускается с их путями). Проводнику отвечаем «скопировано»:
+        // сами файлы остаются на месте.
+        void FilesDropped(object sender, DragEventArgs e)
+        {
+            Slot open = dropFor;
+            SetDropFor(null);
+            Slot at = SlotAt(e.GetPosition(this).X);
+            if (open == null || at != open || demo || open.Item == null) { BinDrop(e); return; }
+            e.Handled = true;
+            e.Effects = DragDropEffects.Copy;
+            SetBinDropHot(false);
+            List<string> paths = BinRules.DropPaths(e.Data.GetData(DataFormats.FileDrop) as string[], delegate(string p) { return System.IO.File.Exists(p) || System.IO.Directory.Exists(p); });
+            DockItem item = open.Item;
+            string args = OpenWith.Arguments(item.Pin != null ? item.Pin.Args : null, paths);
+            if (args == null || !OpenWith.Accepts(item, System.IO.File.Exists)) return;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+            {
+                try { Shell.OpenWith(item, args); Bounce(open); }
+                catch
+                {
+                    int i = slots.IndexOf(open);
+                    if (i < 0) return;
+                    SetHover(i);
+                    tipOverride = OpenWith.Failed;
+                    ShowTip();
+                }
+            }));
+        }
+
+        void BinDrop(DragEventArgs e)
         {
             e.Handled = true;
             bool hot = binDropHot;
@@ -653,10 +940,10 @@ namespace DevTxt.DockApp
             if (!hot || at == null || at.Kind != SlotKind.Bin || demo) return;
             List<string> paths = BinRules.DropPaths(e.Data.GetData(DataFormats.FileDrop) as string[], delegate(string p) { return System.IO.File.Exists(p) || System.IO.Directory.Exists(p); });
             if (paths.Count == 0) return;
-            IntPtr me = new WindowInteropHelper(this).Handle;
+            IntPtr owner = new WindowInteropHelper(this).Handle;
             Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
             {
-                try { BinRules.Recycle(me, paths); } catch { }
+                try { BinRules.Recycle(owner, paths); } catch { }
             }));
         }
 
@@ -1133,7 +1420,10 @@ namespace DevTxt.DockApp
             if (drag != null) KeepDragOrder();
 
             double panelH = PadTop + size + DotZone;
-            winW = work.Width;
+            // Своё место у Windows — высотой с док в покое; занято или отдано, оно решает, где низ дока
+            SyncAppBar();
+            Rect area = Area;
+            winW = area.Width;
             winH = EdgeGap + panelH + Math.Max(size * (MaxScale - 1) + TipGap + TipH, WidgetTipGap + TipMaxH) + TopRoom;
             baseline = winH - EdgeGap - DotZone;
             panelTop = baseline - size - PadTop;
@@ -1141,8 +1431,8 @@ namespace DevTxt.DockApp
             Canvas.SetTop(panel, panelTop);
             stage.Width = winW; stage.Height = winH;
             Width = winW; Height = winH;
-            Left = work.Left;
-            Top = work.Bottom - winH;
+            Left = area.Left;
+            Top = area.Bottom - winH;
 
             SyncDots();
             double full = 0;
@@ -1169,14 +1459,17 @@ namespace DevTxt.DockApp
             if (hub != null) hub.PublishWidgets(shown, Badges());
         }
 
-        // Точка под значком: нет окон — нет точки; окно программы впереди — точка шире и ярче
+        // Точка под значком: нет окон — нет точки; окно программы впереди — точка шире и ярче; окно просит внимания
+        // (и уже отпрыгало) — точка оранжевая
         void SyncDots()
         {
             bool any = false;
             foreach (Slot s in slots)
             {
                 if (s.Kind != SlotKind.Item || s.Dot == null || s.Item == null) continue;
-                double to = s.Leaving || !s.Item.Running ? 0 : fg != IntPtr.Zero && s.Item.Windows.Contains(fg) ? DotWide : DotSize;
+                Brush paint = !s.Leaving && PhaseOf(s.Item) == AttentionPhase.Mark ? askingDot : Ui.Label;
+                if (s.Dot.Background != paint) s.Dot.Background = paint;
+                double to = s.Leaving || !s.Item.Running ? 0 : fg != IntPtr.Zero && s.Item.Windows.Contains(fg) ? DotWide : paint == askingDot ? DotAsking : DotSize;
                 if (to == s.DotW.Target) continue;
                 Go(s.DotW, to, AppearMs);
                 any = true;
@@ -1296,7 +1589,7 @@ namespace DevTxt.DockApp
                     long t = now - s.BounceAt;
                     int hop = (int)(t / BounceMs);
                     if (s.BounceStop < 0 && s.Item != null && s.Item.Running) s.BounceStop = hop + 1;   // окно появилось — допрыгиваем и встаём
-                    if (hop >= (s.BounceStop >= 0 ? Math.Min(BounceCycles, s.BounceStop) : BounceCycles) || Ui.ReducedMotion) { s.BounceAt = -1; s.BounceStop = -1; }
+                    if (hop >= (s.BounceStop >= 0 ? Math.Min(BounceCycles, s.BounceStop) : BounceCycles) || Ui.ReducedMotion) { s.BounceAt = -1; s.BounceStop = -1; dotsLater = true; }
                     else y -= size * BounceHeight * (1 - 0.2 * hop) * Tween.Bounce(t, BounceMs);
                 }
                 // В руке: значок чуть крупнее, с тенью, его середина — у курсора. Между местом и рукой он переходит плавно.
@@ -1319,12 +1612,15 @@ namespace DevTxt.DockApp
                 if (s.Dot == null) continue;
                 double dw = Math.Max(0, dot[i]);
                 s.Dot.Width = dw;
-                s.Dot.Opacity = k[i] * (1 - f) * (0.72 + 0.28 * Math.Max(0, Math.Min(1, (dw - DotSize) / (DotWide - DotSize))));
+                double bright = s.Dot.Background == askingDot ? 1 : 0.72 + 0.28 * Math.Max(0, Math.Min(1, (dw - DotSize) / (DotWide - DotSize)));   // оранжевая — всегда в полную силу
+                s.Dot.Opacity = k[i] * (1 - f) * bright;
                 s.DotMove.X = s.Centre + shift - dw / 2;
                 s.DotMove.Y = baseline + (DotZone - DotSize) / 2 - 1;
             }
             PlaceTip();
             SyncGlass();
+            if (dotsLater && attention.Count > 0) { dotsLater = false; SyncDots(); }
+            dotsLater = false;
         }
 
         // Тень полосы: на месте полосы, внутренность вырезана
@@ -1542,26 +1838,28 @@ namespace DevTxt.DockApp
             }
         }
 
-        // Док стоит у самого низа экрана (панели задач Windows под ним нет)
-        bool AtScreenEdge { get { return work.Bottom >= SystemParameters.PrimaryScreenHeight - 0.5; } }
-
         // Двадцать раз в секунду, и только при включённом автоскрытии: где курсор
         void EdgeTick()
         {
             Point p;
-            if (away || !CursorHere(out p)) return;
+            if (away) { edgeRule.Reset(); return; }   // игра или видео на весь экран: от края не выезжаем вовсе
+            if (!CursorHere(out p)) return;
             long now = clock.ElapsedMilliseconds;
             if (hidden)
             {
-                // Нижний край экрана во всю ширину, полоска в две точки: коснулся — док выезжает сразу. Если под доком
-                // панель задач Windows, ждём, пока курсор задержится: иначе док выскакивал бы по дороге к ней.
+                // Нижний край экрана во всю ширину, полоска в две точки: док выезжает, когда курсор простоял на ней
+                // EdgeReveal.DwellMs (0,35 с) — по дороге к прокрутке и кнопкам внизу окна он не выскакивает. Если под доком
+                // панель задач Windows, это край над ней — правило то же. Перед самым выездом — ещё раз своя проверка
+                // игры: core.txt мог ещё не сказать, а курсор у низа экрана в стратегиях — обычное дело.
                 bool onEdge = p.X >= 0 && p.X <= winW && p.Y >= winH - 2 && p.Y <= winH + 1;
-                edgeHits = onEdge ? edgeHits + 1 : 0;
-                if (edgeHits >= (AtScreenEdge ? 1 : 3)) { edgeHits = 0; lastInside = now; SetHidden(false); StartLoop(); }
+                if (edgeRule.Step(now, onEdge, menuOpen) && !GameAhead()) { lastInside = now; SetHidden(false); StartLoop(); }
             }
             else if (menuOpen || drag != null || InZone(p) || (preview != null && preview.Hot)) lastInside = now;
             else if (now - lastInside > HideAfterMs) SetHidden(true);
         }
+
+        // Впереди на мониторе дока игра или видео на весь экран — по своей проверке, прямо сейчас
+        static bool GameAhead() { return Win.OnDockScreen(Win.Foreground()) && FullScreen.Ahead(); }
 
         void SetHidden(bool hide)
         {
