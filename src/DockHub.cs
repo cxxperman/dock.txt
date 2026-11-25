@@ -2,6 +2,7 @@
 // Док отдаёт туда свои настройки (они появляются на общей странице в core.txt), список приложений и виджетов,
 // принимает оттуда изменения настроек и общий вид: «Меньше движения» для всех приложений разом.
 // От kapsula.txt через хаб приходят музыка, погода, календарь и счётчики непрочитанного; ей же уходят кнопки музыки.
+// От metla.txt — что лежит в корзине (metla.bin); ей — пункты меню бака (bin.open, show с page bin, scan, startup).
 // Семья (Family.cs): от core.txt — core.family («Не беспокоить», игра на весь экран), ему — пункты дока для общего
 // трея (dock.tray, команда tray.run) и горячие клавиши (dock.keys).
 // core.txt может быть не запущен — это нормально: док работает сам по себе, а HubLink тихо пробует снова.
@@ -14,8 +15,8 @@ namespace DevTxt.DockApp
 {
     class DockHub
     {
-        // Ключ --testhook: док принимает ещё три команды — test.act (нажать кнопку виджета), test.state (что док решил
-        // про игру и «Не беспокоить») и test.quit (выйти). Только для проверок.
+        // Ключ --testhook: док принимает ещё три команды — test.act (нажать кнопку виджета или пункт меню корзины),
+        // test.state (что док решил про игру и «Не беспокоить», что с баком) и test.quit (выйти). Только для проверок.
         public static bool TestHook = false;
 
         readonly DockWindow window;
@@ -35,7 +36,7 @@ namespace DevTxt.DockApp
             this.window = window;
             this.store = store;
             link = new HubLink("dock", "Dock", Program.VersionText, TestPort > 0 ? TestPort : HubLink.DefaultPort);
-            link.Topics = new string[] { "hub.theme", "kapsula.media", "kapsula.weather", "kapsula.calendar", "kapsula.unread" };
+            link.Topics = new string[] { "hub.theme", "kapsula.media", "kapsula.weather", "kapsula.calendar", "kapsula.unread", "metla.bin" };
             link.Commands = TestHook ? new string[] { "settings.set", "test.act", "test.state", "test.quit" } : new string[] { "settings.set" };
             link.OnCommand = Command;
             link.OnState = delegate(string topic, object data, string from)
@@ -47,7 +48,7 @@ namespace DevTxt.DockApp
                     bool on = theme != null && theme.TryGetValue("reducedMotion", out reduced) && reduced is bool && (bool)reduced;
                     window.Dispatcher.BeginInvoke(new Action(delegate { Ui.ForceReducedMotion = on; }));
                 }
-                else if (topic != null && topic.StartsWith("kapsula."))
+                else if (topic != null && (topic.StartsWith("kapsula.") || topic == "metla.bin"))
                     window.Dispatcher.BeginInvoke(new Action(delegate { window.HubState(topic, data); }));
             };
             // Хаб пропал — он уже не скажет, что состояний Kapsula больше нет
@@ -98,6 +99,12 @@ namespace DevTxt.DockApp
 
         // Кнопки музыки: prev, toggle, next → команды media.prev, media.toggle, media.next для kapsula.txt
         public void Media(string action) { link.Command("kapsula", "media." + action, null); }
+
+        // Приложение other на связи и понимает команду command (по hub.apps)
+        public bool Has(string other, string command) { return family.Has(other, command); }
+
+        // Корзина: bin.open — открыть её в проводнике; show с page — страница metla.txt (bin, scan, startup)
+        public void Metla(string command, Dictionary<string, object> args) { link.Command("metla", command, args); }
 
         // Состояние уходит целиком и только когда изменилось (или если просили обязательно)
         public void PublishSettings(bool always)
@@ -162,6 +169,14 @@ namespace DevTxt.DockApp
                         object widget, action;
                         args.TryGetValue("widget", out widget);
                         args.TryGetValue("action", out action);
+                        // Корзина: action — open, clean, scan или startup; в ответе — что док отправил
+                        if (widget as string == "bin")
+                        {
+                            string sent = window.BinAction(action as string);
+                            if (sent == null) throw new Exception("такого пункта в меню корзины сейчас нет или он неактивен");
+                            answer = HubLink.Msg("sent", sent);
+                            return;
+                        }
                         if (!window.WidgetAction(widget as string, action as string)) throw new Exception("такого виджета или действия сейчас нет");
                         return;
                     }

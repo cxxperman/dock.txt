@@ -21,9 +21,9 @@ using System.Windows.Threading;
 
 namespace DevTxt.DockApp
 {
-    enum SlotKind { Item, Line, Launcher, Widget }
+    enum SlotKind { Item, Line, Launcher, Widget, Bin }
 
-    // Место в ряду: значок приложения, кнопка меню приложений, черта или виджет
+    // Место в ряду: значок приложения, кнопка меню приложений, черта, виджет или корзина (самая правая, за чертой)
     class Slot
     {
         public SlotKind Kind;
@@ -51,7 +51,7 @@ namespace DevTxt.DockApp
         public long BounceAt = -1;        // когда значок начал подпрыгивать (программа запускается); −1 — не прыгает
         public int BounceStop = -1;       // после какого прыжка остановиться: окно появилось
 
-        public bool Icon { get { return Kind == SlotKind.Item || Kind == SlotKind.Launcher; } }
+        public bool Icon { get { return Kind == SlotKind.Item || Kind == SlotKind.Launcher || Kind == SlotKind.Bin; } }
     }
 
     class DockWindow : Window
@@ -136,6 +136,11 @@ namespace DevTxt.DockApp
         List<string> shown = new List<string>();
         AppMenuWindow appMenu;
 
+        // Корзина: что прислала metla.txt (null — её нет на связи), стоит ли она, несут ли сейчас файлы над баком
+        BinInfo bin;
+        bool binInstalled, binDropHot, binShown;
+        string binKey = "";
+
         // Увеличение: одна пружина от 0 (покой) до 1 (курсор над доком). Сами значки идут за курсором без задержки.
         double amount, velocity, cursorU, lastU = double.NaN, lastAmount = double.NaN;
         bool looping, inside, menuOpen, hidden, fullscreen, away, moving;
@@ -207,6 +212,12 @@ namespace DevTxt.DockApp
             strip.MouseLeave += delegate { Release(); };
             strip.MouseMove += StripMove;
             strip.LostMouseCapture += delegate { armed = null; if (drag != null) CancelDrag(); };
+            // Файлы и папки из проводника принимает только бак; остальные значки на перетаскивание не отвечают, как и раньше
+            strip.AllowDrop = true;
+            strip.DragEnter += BinDragOver;
+            strip.DragOver += BinDragOver;
+            strip.DragLeave += delegate(object s, DragEventArgs e) { e.Handled = true; SetBinDropHot(false); };
+            strip.Drop += BinDrop;
             previewOpen.Tick += delegate { previewOpen.Stop(); PreviewDue(); };
             previewShut.Tick += delegate { previewShut.Stop(); PreviewLeft(); };
             previewPoll.Tick += delegate
@@ -262,6 +273,7 @@ namespace DevTxt.DockApp
             else
             {
                 hub = new DockHub(this, store);
+                binInstalled = BinRules.MetlaInstalled;
                 items = Collect();
                 fg = Win.Foreground();
                 // Громкость: Windows сама сообщает об изменениях (в своём потоке) — опрашивать её не нужно
@@ -298,6 +310,14 @@ namespace DevTxt.DockApp
         }
 
         internal bool Demoing { get { return demo; } }
+
+        // Для снимков (--demo --bin): full — в корзине 12 объектов, empty — пусто, offline — metla.txt не на связи
+        internal void DemoBin(string kind)
+        {
+            if (!demo) return;
+            bin = kind == "offline" ? null : BinInfo.From(HubLink.Msg("count", kind == "empty" ? 0 : 12, "bytes", kind == "empty" ? 0L : 1395864371L));
+            Rebuild();
+        }
 
         readonly DispatcherTimer taskbarTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         readonly DispatcherTimer hookTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
@@ -373,6 +393,9 @@ namespace DevTxt.DockApp
                 battery = b;
                 if (audio != null) audio.Rebind();
                 if (ReadVolume()) widgetsDirty = true;
+                // metla.txt поставили или удалили — бак появляется или уходит
+                bool metla = BinRules.MetlaInstalled;
+                if (metla != binInstalled) { binInstalled = metla; widgetsDirty = true; }
             }
             var now = Collect();
             bool moved = SystemParameters.WorkArea != work;   // сменили разрешение или передвинули панель задач
@@ -462,6 +485,7 @@ namespace DevTxt.DockApp
             else if (topic == "kapsula.weather") weather = WeatherInfo.From(data);
             else if (topic == "kapsula.calendar") calendar = CalendarInfo.From(data);
             else if (topic == "kapsula.unread") unread = UnreadInfo.From(data);
+            else if (topic == "metla.bin") bin = BinInfo.From(data);
             else return;
             Rebuild();
         }
@@ -471,7 +495,7 @@ namespace DevTxt.DockApp
         {
             if (ended || hubRaw.Count == 0) return;
             hubRaw.Clear();
-            media = null; weather = null; calendar = null; unread = null;
+            media = null; weather = null; calendar = null; unread = null; bin = null;
             Rebuild();
         }
 
@@ -504,6 +528,8 @@ namespace DevTxt.DockApp
         {
             if (ended || demo) return;
             SyncGame();
+            // metla.txt подключилась или ушла — у бака другие пункты меню, а может, он сам появился или ушёл
+            if (BinKey() != binKey) Rebuild();
         }
 
         // «Не беспокоить» в core.txt: док не привлекает внимание движением (счётчики остаются, только не выскакивают)
@@ -524,7 +550,127 @@ namespace DevTxt.DockApp
         {
             return HubLink.Msg("fullscreen", fullscreen, "away", away, "local", FullScreen.Ahead(), "screen", Win.OnDockScreen(Win.Foreground()),
                 "coreOnline", hub != null && hub.CoreOnline, "coreGame", hub != null && hub.Game, "quiet", Quiet,
-                "autoHide", store.AutoHide, "taskbarTaken", TaskbarSwap.Active, "winKeyHooked", WinKey.Installed);
+                "autoHide", store.AutoHide, "taskbarTaken", TaskbarSwap.Active, "winKeyHooked", WinKey.Installed, "bin", BinState());
+        }
+
+        // ───────── Корзина ─────────
+        // metla.txt на связи: прислала metla.bin или видна в hub.apps
+        bool MetlaOnline { get { return demo ? bin != null : bin != null || BinCan("bin.open") || BinCan("show"); } }
+
+        bool BinCan(string command) { return demo ? bin != null : hub != null && hub.Has("metla", command); }
+
+        bool BinVisible { get { return BinRules.Visible(store.Bin, binInstalled, MetlaOnline); } }
+
+        // Всё, от чего зависят бак и его меню: поменялось — док перерисовывается
+        string BinKey()
+        {
+            return BinVisible + "|" + MetlaOnline + "|" + BinCan("bin.open") + "|" + BinCan("show") + "|" + (bin == null ? "-" : bin.Count + ":" + bin.Bytes);
+        }
+
+        List<BinRow> BinMenu() { return BinRules.Menu(bin, BinCan("show")); }
+
+        // Для test.state: есть ли бак, какой он, что в подписи и в меню
+        Dictionary<string, object> BinState()
+        {
+            Slot s = slots.Find(delegate(Slot x) { return x.Kind == SlotKind.Bin && !x.Leaving; });
+            var rows = new List<object>();
+            foreach (BinRow r in BinMenu()) rows.Add(r.Line ? (object)HubLink.Msg("line", true) : HubLink.Msg("label", r.Label, "act", r.Act, "enabled", r.Enabled));
+            return HubLink.Msg("shown", s != null, "sprite", s == null ? null : BinRules.Sprite(bin == null ? 0 : bin.Count, binDropHot) == BinRules.Full ? "bin-full" : "bin",
+                "online", MetlaOnline, "installed", binInstalled, "setting", store.Bin, "count", bin == null ? (object)null : bin.Count, "bytes", bin == null ? (object)null : bin.Bytes,
+                "tip", BinRules.Tip(bin), "menu", rows.ToArray(), "last", slots.Count > 0 && slots[slots.Count - 1] == s);
+        }
+
+        // Пункт меню бака: open, clean, scan, startup. Сюда же — проверочная команда test.act. Что отправлено (null — пункта
+        // сейчас нет или он неактивен): «bin.open», «show:bin», «show:scan», «show:startup» или «explorer» — metla.txt нет,
+        // корзину открывает сам проводник (в снимках и без окна — не открывает).
+        internal string BinAction(string act)
+        {
+            BinRow row = BinMenu().Find(delegate(BinRow r) { return r.Act == act && r.Act != null; });
+            if (row == null || !row.Enabled) return null;
+            if (act == "open")
+            {
+                if (BinCan("bin.open")) { if (!demo) hub.Metla("bin.open", null); return "bin.open"; }
+                if (!demo && !headless) try { using (Process.Start("explorer.exe", "shell:RecycleBinFolder")) { } } catch { }
+                return "explorer";
+            }
+            string page = BinRules.Page(act);
+            if (page == null) return null;
+            if (!demo) hub.Metla("show", HubLink.Msg("page", page));
+            return "show:" + page;
+        }
+
+        // Бак: пиксельный спрайт из kit.txt, по размеру значка дока. Полный — когда в корзине что-то есть или над ним файлы.
+        Slot BinSlot()
+        {
+            var slot = new Slot { Kind = SlotKind.Bin, Id = "bin", W = size, Built = size };
+            var face = new Border { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            // Края пикселей — резкие, как у остальных пиксельных значков семьи, и при увеличении под курсором тоже
+            RenderOptions.SetEdgeMode(face, EdgeMode.Aliased);
+            var root = new Grid { Width = size, Height = size, RenderTransformOrigin = new Point(0.5, 1), IsHitTestVisible = false, Children = { face } };
+            root.RenderTransform = new TransformGroup { Children = { slot.Scale, slot.Move } };
+            slot.Root = root;
+            string[] now = null;
+            slot.Update = delegate
+            {
+                string[] want = BinRules.Sprite(bin == null ? 0 : bin.Count, binDropHot);
+                if (want == now) return;
+                now = want;
+                face.Child = Ui.Sprite(want, Math.Round(size * 0.8));
+            };
+            slot.Update();
+            return slot;
+        }
+
+        // Файлы над доком: над баком — крышка приподнята и курсор «Переместить», над остальным — нельзя
+        void BinDragOver(object sender, DragEventArgs e)
+        {
+            e.Handled = true;
+            Slot at = SlotAt(e.GetPosition(this).X);
+            bool hot = at != null && at.Kind == SlotKind.Bin && !at.Leaving && e.Data.GetDataPresent(DataFormats.FileDrop);
+            e.Effects = hot ? DragDropEffects.Move : DragDropEffects.None;
+            SetBinDropHot(hot);
+            StartLoop();   // кнопка мыши у проводника: движения мыши док не получает, кадры идут сами — бак растёт под курсором
+        }
+
+        void SetBinDropHot(bool hot)
+        {
+            if (hot == binDropHot) return;
+            binDropHot = hot;
+            Slot s = Find("bin");
+            if (s != null && s.Update != null) s.Update();
+        }
+
+        // Бросили на бак: в корзину Windows с возможностью восстановить. Проводнику отвечаем «ничего не сделано» (None):
+        // при «Переместить» он мог бы сам удалить исходные файлы — а их уже кладёт в корзину сама Windows по нашей просьбе.
+        // Сама просьба — после того, как проводник отпустил перетаскивание, чтобы его окно не ждало вопроса Windows.
+        void BinDrop(object sender, DragEventArgs e)
+        {
+            e.Handled = true;
+            bool hot = binDropHot;
+            SetBinDropHot(false);
+            e.Effects = DragDropEffects.None;
+            Slot at = SlotAt(e.GetPosition(this).X);
+            if (!hot || at == null || at.Kind != SlotKind.Bin || demo) return;
+            List<string> paths = BinRules.DropPaths(e.Data.GetData(DataFormats.FileDrop) as string[], delegate(string p) { return System.IO.File.Exists(p) || System.IO.Directory.Exists(p); });
+            if (paths.Count == 0) return;
+            IntPtr me = new WindowInteropHelper(this).Handle;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+            {
+                try { BinRules.Recycle(me, paths); } catch { }
+            }));
+        }
+
+        PopMenu BuildBinMenu()
+        {
+            var menu = new PopMenu();
+            foreach (BinRow r in BinMenu())
+            {
+                if (r.Line) { menu.Line(); continue; }
+                if (r.Act == null) { menu.Item(r.Label, false, null); continue; }   // сведение: сколько лежит, неактивно
+                string act = r.Act;
+                menu.Item(r.Label, false, r.Enabled ? new Action(delegate { BinAction(act); }) : null);
+            }
+            return menu;
         }
 
         // «Настройки» в меню дока — страница дока в core.txt. Запущенный core.txt просим через хаб; установленный, но
@@ -890,7 +1036,9 @@ namespace DevTxt.DockApp
             double sizeBefore = size;
             widgetsDirty = false;
             signature = Logic.Signature(items);
-            int count = items.Count + 1;   // значки и кнопка меню приложений
+            binKey = BinKey();
+            binShown = BinVisible;
+            int count = items.Count + 1 + (binShown ? 1 : 0);   // значки, кнопка меню приложений и корзина
             bool split = items.Exists(delegate(DockItem i) { return i.Pinned; }) && items.Exists(delegate(DockItem i) { return !i.Pinned; });
 
             DateTime now = Today;
@@ -905,7 +1053,7 @@ namespace DevTxt.DockApp
                 size = want;
                 gap = Math.Round(size * 0.17);
                 widgets = WidgetSlots(ids, tight);
-                double taken = (split ? 1 + gap : 0) + (widgets.Count > 0 ? 1 + gap : 0);
+                double taken = (split ? 1 + gap : 0) + (widgets.Count > 0 ? 1 + gap : 0) + (binShown ? 1 + gap : 0);
                 foreach (Slot w in widgets) taken += w.W + gap;
                 double fit = Math.Floor((room - taken) / (count * 1.17));
                 if (fit >= Math.Min(want, 32) || ids.Count == 0)
@@ -940,6 +1088,14 @@ namespace DevTxt.DockApp
             }
             if (widgets.Count > 0) next.Add(Reuse("line:widgets") ?? LineSlot("line:widgets"));
             next.AddRange(widgets);
+            // Корзина — самая правая, за своей чертой, как на Mac
+            if (binShown)
+            {
+                next.Add(Reuse("line:bin") ?? LineSlot("line:bin"));
+                Slot b = Reuse("bin");
+                if (b != null) b.Update(); else b = BinSlot();
+                next.Add(b);
+            }
 
             // Уходящие остаются на своих местах, пока гаснут: каждый — сразу за прежним соседом слева
             var merged = new List<Slot>(next);
@@ -1253,7 +1409,7 @@ namespace DevTxt.DockApp
 
         string TipFor(Slot s)
         {
-            return s.Kind == SlotKind.Item ? s.Item.Name : s.Kind == SlotKind.Launcher ? AppsTip : s.Kind == SlotKind.Widget ? s.Tip : null;
+            return s.Kind == SlotKind.Item ? s.Item.Name : s.Kind == SlotKind.Launcher ? AppsTip : s.Kind == SlotKind.Widget ? s.Tip : s.Kind == SlotKind.Bin ? BinRules.Tip(bin) : null;
         }
 
         void PlaceTip()
@@ -1485,7 +1641,7 @@ namespace DevTxt.DockApp
                 return;
             }
             Slot s = SlotAt(e.GetPosition(this).X);
-            if (e.ChangedButton == MouseButton.Right) { OpenMenu(s != null && s.Kind == SlotKind.Item ? s : null); return; }
+            if (e.ChangedButton == MouseButton.Right) { OpenMenu(s != null && (s.Kind == SlotKind.Item || s.Kind == SlotKind.Bin) ? s : null); return; }
             if (e.ChangedButton != MouseButton.Left) return;
             Slot was = pressed;
             Disarm();
@@ -1808,6 +1964,7 @@ namespace DevTxt.DockApp
         {
             if (s.Kind == SlotKind.Launcher) { if (!middle) ToggleApps(); return; }
             if (s.Kind == SlotKind.Item) { Clicked(s, middle); return; }
+            if (s.Kind == SlotKind.Bin) { if (!middle) OpenMenu(s); return; }   // щелчок по баку — его меню
             if (s.Kind != SlotKind.Widget || demo) return;
             // Виджеты открывают то, что на их месте открыла бы панель задач Windows
             if (s.Widget == "volume") { if (middle) VolumeMute(); else WinKey.Chord('A'); }   // Win+A — быстрые настройки
@@ -1874,6 +2031,7 @@ namespace DevTxt.DockApp
 
         PopMenu BuildMenu(Slot slot)
         {
+            if (slot != null && slot.Kind == SlotKind.Bin) return BuildBinMenu();
             var menu = new PopMenu();
             DockItem item = slot != null ? slot.Item : null;
             if (item != null)
@@ -1982,7 +2140,9 @@ namespace DevTxt.DockApp
         {
             battery = BatteryInfo.From(0, 0, 82);
             hasVolume = true; volLevel = 0.4;
+            binInstalled = true;   // в выдуманном доке metla.txt «установлена»: бак есть; без хаба — она не на связи
             if (!hubData) return;
+            bin = BinInfo.From(HubLink.Msg("count", 12, "bytes", 1395864371L));
             media = MediaInfo.From(HubLink.Msg("playing", true, "title", "Midnight City", "artist", "M83", "app", "Spotify"));
             weather = WeatherInfo.From(HubLink.Msg("temp", -3.4, "text", "Снег", "icon", "snow", "city", "Москва"));
             calendar = CalendarInfo.From(HubLink.Msg("events", new object[]
@@ -2004,7 +2164,7 @@ namespace DevTxt.DockApp
             int index = -1, n = 0;
             for (int i = 0; i < slots.Count && over >= 0; i++)
                 if (slots[i].Kind == SlotKind.Item && n++ == over) index = i;
-            if (overWidget != null) index = slots.FindIndex(delegate(Slot s) { return s.Kind == SlotKind.Widget && s.Widget == overWidget || s.Kind == SlotKind.Launcher && overWidget == "apps"; });
+            if (overWidget != null) index = slots.FindIndex(delegate(Slot s) { return s.Kind == SlotKind.Widget && s.Widget == overWidget || s.Kind == SlotKind.Launcher && overWidget == "apps" || s.Kind == SlotKind.Bin && overWidget == "bin"; });
             if (index >= 0)
             {
                 cursorU = RestCentre(index);
@@ -2059,7 +2219,7 @@ namespace DevTxt.DockApp
             FrameworkElement box = null;
             if (index >= 0 && withMenu)
             {
-                PopMenu menu = BuildMenu(slots[index].Kind == SlotKind.Item ? slots[index] : null);
+                PopMenu menu = BuildMenu(slots[index].Kind == SlotKind.Item || slots[index].Kind == SlotKind.Bin ? slots[index] : null);
                 box = (FrameworkElement)menu.Content;
                 menu.Content = null;
                 box.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));

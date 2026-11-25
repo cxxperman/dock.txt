@@ -8,6 +8,7 @@
 //                       и --hover над одним из них он в снимке включён — каким его видит тот, кто его включил
 //                       --previews — вместе с --demo и --hover N: над значком панель с его окнами (окна нарисованные);
 //                       --drag N — вместе с --demo: закреплённый значок N будто бы несут на два места правее; --out — унесли из дока
+//   --bin full|empty|offline  вместе с --demo: что в выдуманной корзине; --hover bin — курсор над баком
 //   --apps              вместе с --shot: нарисовать меню приложений; --query текст — с этим текстом в поиске
 //   --selftest          проверить сборку значков из окон, закрепление, увеличение, настройки, виджеты, счётчики, названия и поиск в меню,
 //                       пункты для трея и клавиши core.txt и уход из-под игры на весь экран; код выхода 0 — всё в порядке
@@ -99,6 +100,7 @@ namespace DevTxt.DockApp
                 app.SessionEnding += delegate { WinKey.Stop(); TaskbarSwap.Give(store.Dir); };
             }
             var w = new DockWindow(demo, store, headless, Array.IndexOf(args, "--nohub") < 0);
+            if (demo && Arg(args, "--bin") != null) w.DemoBin(Arg(args, "--bin"));
             if (shot != null)
             {
                 // Панель с окнами и перетаскивание рисуются только выдуманными: настоящие окна и закреплённое не трогаются
@@ -407,7 +409,7 @@ namespace DevTxt.DockApp
             var d = s.Describe();
             var groups = d["groups"] as object[];
             var list = groups != null && groups.Length == 3 ? ((Dictionary<string, object>)groups[0])["items"] as object[] : null;
-            Check(list != null && list.Length == 5, "the first group has five settings");
+            Check(list != null && list.Length == 6, "the first group has six settings");
             var tgroup = groups != null && groups.Length == 3 ? (Dictionary<string, object>)groups[1] : null;
             var tlist = tgroup != null ? tgroup["items"] as object[] : null;
             Check(tgroup != null && (string)tgroup["title"] == "Панель задач" && tlist != null && tlist.Length == 2
@@ -433,14 +435,14 @@ namespace DevTxt.DockApp
                 Check(offByDefault == "widgetMusic widgetCalendar widgetWeather " && islandHints == offByDefault, "music, calendar and weather are off by default and their hints say the island kapsula.txt shows the same; volume, battery, clock and badges stay on, got " + offByDefault + "/ " + islandHints);
                 Check(fromKapsula == "widgetMusic widgetCalendar widgetWeather badges ", "the hints still say these widgets need data from kapsula.txt (without it they stay empty), got " + fromKapsula);
             }
-            if (list != null && list.Length == 5)
+            if (list != null && list.Length == 6)
             {
                 string keys = "", types = "";
                 foreach (Dictionary<string, object> it in list) { keys += it["key"] + " "; types += it["type"] + " "; Check(it.ContainsKey("label") && it.ContainsKey("value"), "every setting has a label and a value"); }
-                Check(keys == "autoHide magnify showRunning size autostart " && types == "switch switch switch slider switch ", "three switches, the size slider and autostart, got " + keys + "/ " + types);
-                var size = (Dictionary<string, object>)list[3];
+                Check(keys == "autoHide magnify showRunning bin size autostart " && types == "switch switch switch switch slider switch ", "four switches (the bin among them), the size slider and autostart, got " + keys + "/ " + types);
+                var size = (Dictionary<string, object>)list[4];
                 Check((int)size["min"] == 36 && (int)size["max"] == 72 && (int)size["value"] == 48, "icon size runs from 36 to 72 and starts at 48");
-                var auto = (Dictionary<string, object>)list[4];
+                var auto = (Dictionary<string, object>)list[5];
                 Check((string)auto["label"] == "Запускать вместе с Windows" && (string)auto["section"] == "startup" && !(bool)auto["value"], "«Запускать вместе с Windows» goes to «Общие» → «Запуск и обновления» in core.txt and is off by default");
             }
             string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(d);
@@ -753,6 +755,74 @@ namespace DevTxt.DockApp
             Check(SessionRules.Command("lock", out exe, out args) && exe == null && !SessionRules.Command("format", out exe, out args), "lock needs no program; an unknown command is refused");
             Check(SessionRules.Confirm("shutdown") == "Точно выключить?" && SessionRules.Confirm("restart") == "Точно перезагрузить?" && SessionRules.Confirm("sleep") == null && SessionRules.Confirm("lock") == null, "only shutdown and restart ask twice");
             Check(!Session.Armed && !Session.Run("lock") && !Session.Run("shutdown"), "a self-test never locks, sleeps or shuts down the computer");
+            Bin();
+        }
+
+        static string Menu(List<BinRow> rows)
+        {
+            string r = "";
+            foreach (BinRow b in rows) r += b.Line ? "— | " : b.Label + (b.Act == null ? "" : b.Enabled ? "" : " (off)") + " | ";
+            return r;
+        }
+
+        // Корзина metla.txt в доке
+        static void Bin()
+        {
+            // ── Спрайт: те же строки, что в kit.txt (glyphs), полный — когда что-то лежит ──
+            Check(BinRules.Empty.Length == 12 && BinRules.Full.Length == 12 && Array.TrueForAll(BinRules.Empty, delegate(string r) { return r.Length == 12; }) && Array.TrueForAll(BinRules.Full, delegate(string r) { return r.Length == 12; }), "bin sprites are 12×12");
+            Check(BinRules.Empty[0] == "....####...." && BinRules.Empty[5] == ".##E####E##." && BinRules.Full[0] == "...##......." && BinRules.Full[11] == "..########..", "the sprites are the kit.txt glyphs «bin» and «bin-full»");
+            Check(BinRules.Sprite(0, false) == BinRules.Empty && BinRules.Sprite(1, false) == BinRules.Full && BinRules.Sprite(500, false) == BinRules.Full && BinRules.Sprite(-1, false) == BinRules.Empty, "an empty bin has its lid shut, anything inside lifts it");
+            Check(BinRules.Sprite(0, true) == BinRules.Full, "files carried over the empty bin lift the lid too");
+            // ── Размер и склонения ──
+            Check(BinRules.Size(0) == "0\u00A0Б" && BinRules.Size(512) == "512\u00A0Б" && BinRules.Size(12 * 1024) == "12\u00A0КБ" && BinRules.Size(3565158) == "3,4\u00A0МБ" && BinRules.Size(500L * 1024 * 1024) == "500\u00A0МБ", "bytes, kilobytes, megabytes, got " + BinRules.Size(3565158));
+            Check(BinRules.Size(5 * BinRules.GB) == "5\u00A0ГБ" && BinRules.Size(BinRules.GB * 5 / 4) == "1,25\u00A0ГБ" && BinRules.Size(BinRules.GB * 124 / 10) == "12,4\u00A0ГБ" && BinRules.Size(BinRules.GB * 250) == "250\u00A0ГБ", "gigabytes the way metla.txt writes them, got " + BinRules.Size(BinRules.GB * 124 / 10));
+            Check(BinRules.Objects(0) == "0\u00A0объектов" && BinRules.Objects(1) == "1\u00A0объект" && BinRules.Objects(2) == "2\u00A0объекта" && BinRules.Objects(5) == "5\u00A0объектов", "0, 1, 2, 5 objects");
+            Check(BinRules.Objects(11) == "11\u00A0объектов" && BinRules.Objects(21) == "21\u00A0объект" && BinRules.Objects(104) == "104\u00A0объекта" && BinRules.Objects(1234) == "1\u00A0234\u00A0объекта", "11, 21, 104 and a thousand-something");
+            // ── Сведение и подпись ──
+            BinInfo none = BinInfo.From(Parse("{\"count\":0,\"bytes\":0}")), one = BinInfo.From(Parse("{\"count\":1,\"bytes\":12288}")), two = BinInfo.From(Parse("{\"count\":2,\"bytes\":3565158}")), five = BinInfo.From(Parse("{\"count\":5,\"bytes\":1342177280}"));
+            Check(none != null && none.Count == 0 && five != null && five.Count == 5 && five.Bytes == 1342177280, "metla.bin is read");
+            Check(BinInfo.From(null) == null && BinInfo.From(Parse("{\"count\":\"3\",\"bytes\":1}")) == null && BinInfo.From(Parse("{\"count\":3}")) == null && BinInfo.From(Parse("[1]")) == null, "no state or a wrong shape — metla.txt is not there");
+            Check(BinInfo.From(Parse("{\"count\":3,\"bytes\":1.5E10}")).Bytes == 15000000000L, "big byte counts arrive as whatever number the parser picked");
+            Check(BinRules.Summary(none) == "Корзина пуста" && BinRules.Summary(one) == "В корзине 1\u00A0объект, 12\u00A0КБ" && BinRules.Summary(two) == "В корзине 2\u00A0объекта, 3,4\u00A0МБ" && BinRules.Summary(five) == "В корзине 5\u00A0объектов, 1,25\u00A0ГБ" && BinRules.Summary(null) == null,
+                "menu summary for 0, 1, 2 and 5 objects, got " + BinRules.Summary(two));
+            Check(BinRules.Tip(none) == "Корзина\nпусто" && BinRules.Tip(five) == "Корзина\n5\u00A0объектов · 1,25\u00A0ГБ" && BinRules.Tip(null) == "Корзина\nmetla.txt не запущена", "the label: «Корзина» and under it what is inside, «пусто» or that metla.txt is not running");
+            // ── Меню ──
+            Check(Menu(BinRules.Menu(five, true)) == "В корзине 5\u00A0объектов, 1,25\u00A0ГБ | Открыть корзину | Очистить корзину… | — | Найти, что занимает место… | Автозапуск Windows… | ", "a full bin with metla.txt online, got " + Menu(BinRules.Menu(five, true)));
+            Check(Menu(BinRules.Menu(none, true)) == "Корзина пуста | Открыть корзину | Очистить корзину… (off) | — | Найти, что занимает место… | Автозапуск Windows… | ", "an empty bin: nothing to clean");
+            Check(Menu(BinRules.Menu(null, false)) == "Открыть корзину | Очистить корзину… (off) | ", "metla.txt not running: only «Открыть корзину» works, cleaning is greyed out, got " + Menu(BinRules.Menu(null, false)));
+            Check(BinRules.Menu(five, true)[0].Act == null && !BinRules.Menu(five, true)[0].Enabled, "the summary row is not clickable");
+            Check(BinRules.Page("clean") == "bin" && BinRules.Page("scan") == "scan" && BinRules.Page("startup") == "startup" && BinRules.Page("open") == null, "«Очистить корзину…» opens metla.txt's confirmation (show page bin); the dock never empties the bin itself");
+            // ── Когда бак в доке ──
+            Check(BinRules.Visible(true, true, false) && BinRules.Visible(true, false, true) && BinRules.Visible(true, true, true), "the bin shows when metla.txt is installed or online and the setting is on");
+            Check(!BinRules.Visible(false, true, true) && !BinRules.Visible(true, false, false) && !BinRules.Visible(false, false, false), "no bin with the setting off or without metla.txt");
+            var st = new Store(null);
+            Check(st.Bin && FirstItem(st, "bin"), "«Корзина в доке» is on by default");
+            st.Apply("bin", false);
+            Check(!st.Bin && !FirstItem(st, "bin"), "settings.set bin=false switches it off");
+            bool refused = false;
+            try { st.Apply("bin", "yes"); } catch { refused = true; }
+            Check(refused && !st.Bin, "the bin switch does not take text");
+            string dir = Path.Combine(Path.GetTempPath(), "dock.txt-test-bin-" + System.Diagnostics.Process.GetCurrentProcess().Id);
+            try
+            {
+                var a = new Store(dir);
+                a.Apply("bin", false);
+                var b = new Store(dir);
+                Check(b.Load() && !b.Bin, "the bin switch survives a restart");
+                File.WriteAllText(Path.Combine(dir, "state.json"), "{\"pins\":[],\"settings\":{\"islandWidgets\":true}}");
+                var old = new Store(dir);
+                Check(old.Load() && old.Bin, "a state file from before the bin: the bin is on");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+            Check(BinRules.MetlaPath.EndsWith(@"\Programs\dev.txt\Metla\Metla.exe"), "metla.txt is looked for where core.txt installs it");
+            // ── Перетаскивание: что уйдёт в корзину ──
+            Func<string, bool> exists = delegate(string p) { return p.StartsWith(@"C:\keep", StringComparison.OrdinalIgnoreCase); };
+            List<string> dropped = BinRules.DropPaths(new string[] { @"C:\keep\a.txt", @"c:\KEEP\A.TXT", @"C:\keep\folder", @"C:\gone\b.txt", "relative.txt", "", null, @"C:\", @"C:\keep\x" + "\0" + "y" }, exists);
+            Check(dropped.Count == 2 && dropped[0] == @"C:\keep\a.txt" && dropped[1] == @"C:\keep\folder", "only full paths that exist go to the bin, each once; never a drive root, got " + string.Join(";", dropped.ToArray()));
+            Check(BinRules.DropPaths(null, exists).Count == 0 && BinRules.DropPaths(new string[0], exists).Count == 0, "nothing dropped — nothing to do");
+            Check(BinRules.FromList(dropped) == "C:\\keep\\a.txt\0C:\\keep\\folder\0", "the list for Windows: paths split by \\0 (the closing second \\0 comes with the string)");
+            Check(BinRules.FO_DELETE == 3 && BinRules.RecycleFlags == 0x4040 && (BinRules.RecycleFlags & 0x10) == 0, "delete with undo (to the Recycle Bin) and a warning if something would be deleted for good; Windows is not told to skip its questions");
+            Check(!BinRules.Recycle(IntPtr.Zero, new List<string>()) && !BinRules.Recycle(IntPtr.Zero, null), "an empty list never reaches Windows");
         }
     }
 }

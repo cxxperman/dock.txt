@@ -484,7 +484,7 @@ namespace DevTxt.DockApp
 
         public readonly string Dir;   // null — ничего не читаем и не пишем (--demo)
         public List<Pin> Pins = new List<Pin>();
-        public bool AutoHide = false, Magnify = true, ShowRunning = true;
+        public bool AutoHide = false, Magnify = true, ShowRunning = true, Bin = true;   // Bin — корзина metla.txt в правом конце дока
         // Что внизу экрана: «both» — dock.txt над панелью задач Windows (как было всегда), «dock» — только dock.txt,
         // панель Windows спрятана; «modern» — только компактная панель задач Windows, дока не видно.
         public string Bar = "both";
@@ -545,6 +545,7 @@ namespace DevTxt.DockApp
                 AutoHide = Flag(s, "autoHide", AutoHide);
                 Magnify = Flag(s, "magnify", Magnify);
                 ShowRunning = Flag(s, "showRunning", ShowRunning);
+                Bin = Flag(s, "bin", Bin);
                 string bar = Str(s, "bar");
                 Bar = Array.IndexOf(Bars, bar) >= 0 ? bar : Flag(s, "replaceTaskbar", false) ? "dock" : "both";   // прежняя настройка — переключатель
                 WinKey = Flag(s, "winKey", WinKey);
@@ -579,7 +580,7 @@ namespace DevTxt.DockApp
                     if (p.App != null) one["app"] = p.App;
                     pins.Add(one);
                 }
-                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "size", Size, "bar", Bar, "winKey", WinKey);
+                var set = HubLink.Msg("autoHide", AutoHide, "magnify", Magnify, "showRunning", ShowRunning, "bin", Bin, "size", Size, "bar", Bar, "winKey", WinKey);
                 foreach (string k in WidgetKeys) set[k] = Flags[k];
                 set[IslandMark] = true;
                 var d = HubLink.Msg("pins", pins.ToArray(), "settings", set);
@@ -635,6 +636,7 @@ namespace DevTxt.DockApp
                 HubLink.Msg("key", "autoHide", "type", "switch", "label", "Автоскрытие дока", "hint", "Док уезжает за нижний край экрана и возвращается, когда курсор касается этого края", "value", AutoHide),
                 HubLink.Msg("key", "magnify", "type", "switch", "label", "Увеличение под курсором", "hint", "Значки рядом с курсором плавно растут, как в macOS", "value", Magnify),
                 HubLink.Msg("key", "showRunning", "type", "switch", "label", "Показывать запущенные", "hint", "После закреплённых приложений идут те, у которых сейчас открыто окно", "value", ShowRunning),
+                HubLink.Msg("key", "bin", "type", "switch", "label", "Корзина в доке", "hint", "Бак в правом конце дока, как на Mac: сколько лежит в корзине Windows и её меню; брошенные на бак файлы уходят в корзину. Нужна metla.txt", "value", Bin),
                 HubLink.Msg("key", "size", "type", "slider", "label", "Размер значков", "value", Size, "min", MinSize, "max", MaxSize, "step", 2, "unit", "px"),
                 // section — core.txt показывает пункт на общей странице «Общие» → «Запуск и обновления», рядом с остальными приложениями
                 HubLink.Msg("key", "autostart", "type", "switch", "label", "Запускать вместе с Windows", "hint", "Док появляется сам, как только вы вошли в Windows", "value", Autostart.IsOn(), "section", "startup")
@@ -680,11 +682,11 @@ namespace DevTxt.DockApp
                 Autostart.Set((bool)value);
                 return;
             }
-            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
+            else if (key == "autoHide" || key == "magnify" || key == "showRunning" || key == "bin" || key == "winKey" || (key != null && Flags.ContainsKey(key)))
             {
                 if (!(value is bool)) throw new Exception("нужно «да» или «нет»");
                 bool on = (bool)value;
-                if (key == "autoHide") AutoHide = on; else if (key == "magnify") Magnify = on; else if (key == "showRunning") ShowRunning = on;
+                if (key == "autoHide") AutoHide = on; else if (key == "magnify") Magnify = on; else if (key == "showRunning") ShowRunning = on; else if (key == "bin") Bin = on;
                 else if (key == "winKey") WinKey = on; else Flags[key] = on;
             }
             else throw new Exception("такой настройки нет");
