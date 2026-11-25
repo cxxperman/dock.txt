@@ -797,6 +797,33 @@ namespace DevTxt.DockApp
             int r150 = AppBarRules.Reserved(hi, new PxRect(0, 1512, 2880, 1620), false), m150 = AppBarRules.Missing(AppBarRules.Height(77, 1.5), r150);
             PxRect b150 = AppBarRules.Settle(AppBarRules.Ask(hi, m150, r150), hi, m150);
             Check(r150 == 108 && m150 == 8 && b150.Same(new PxRect(0, 1504, 2880, 1512)) && AppBarRules.BottomPx(hi, b150.B, r150) == 1620, "at 150 %: 108 held, 8 px band at 1504–1512, the dock at 1504–1620; got " + b150);
+            // Числа с живой машины 0.7.1: компактная панель Windows (TabletPostureTaskbar = 1) свёрнута и держит 24 точки
+            // (рабочая область 0,0–3440,1416), хотя её окно — 0,1368–3440,1440, автоскрытия нет. Док по окну панели считал
+            // 72, просил полосу 1363–1368 посреди рабочей области (Windows её не учитывает) и вставал над полосой в 24 точки.
+            PxRect work24 = new PxRect(0, 0, 3440, 1416);
+            int old72 = AppBarRules.Reserved(wide, held, false);
+            int bad = AppBarRules.BottomPx(wide, work24.B, old72);
+            Check(old72 == 72 && bad == 1416, "the old count: 72 from the taskbar's window, so the dock stood at 1416 above an empty 24 px strip; got " + old72 + ", " + bad);
+            int h24 = AppBarRules.Held(wide, work24, false, new PxRect()), r24 = AppBarRules.Reserved(wide, held, false, h24), m24 = AppBarRules.Missing(77, r24);
+            PxRect b24 = AppBarRules.Settle(AppBarRules.Ask(wide, m24, r24), wide, m24);
+            int bottom24 = AppBarRules.BottomPx(wide, b24.B, r24);
+            Check(h24 == 24 && r24 == 24 && m24 == 53, "the compact taskbar holds 24 px by the work area: the dock takes the missing 53, got " + h24 + ", " + r24 + ", " + m24);
+            Check(b24.Same(new PxRect(0, 1363, 3440, 1416)) && bottom24 == 1440 && bottom24 - 77 == b24.T, "the 53 px band is 1363–1416, the dock stands at 1363–1440 at the very bottom, the work area ends at its top; got " + b24 + ", bottom " + bottom24);
+            Check(AppBarRules.BottomPx(wide, work24.B, r24) == 1440, "before the band is taken (or with auto-hide) the dock already goes down to 1440 over the compact taskbar");
+            PxRect work1363 = new PxRect(0, 0, 3440, 1363);
+            Check(AppBarRules.Held(wide, work1363, true, b24) == 24 && AppBarRules.Reserved(wide, held, false, AppBarRules.Held(wide, work1363, true, b24)) == 24, "with the band taken (work area 1363) it still counts 24 below the band: nothing moves");
+            Check(AppBarRules.Held(wide, work24, true, new PxRect(0, 1363, 3440, 1368)) == 24, "a stale band in the middle of the work area (Windows ignores it) counts nothing: 24 by the work area, the band is asked again");
+            Check(AppBarRules.Held(wide, new PxRect(0, 0, 3440, 1368), false, new PxRect()) == 72 && AppBarRules.Reserved(wide, held, false, 72) == 72, "the full taskbar that holds its whole 72 px still counts 72");
+            Check(AppBarRules.Held(wide, new PxRect(0, 0, 3440, 1363), true, new PxRect(0, 1363, 3440, 1440)) == 0 && AppBarRules.Reserved(wide, held, true, 24) == 0, "the full band at the bottom or a taskbar with auto-hide: nothing held");
+            Check(AppBarRules.Held(wide, new PxRect(), false, new PxRect()) == 0 && AppBarRules.Reserved(wide, held, false, -3) == 0, "no work area known: nothing held; nonsense counts as nothing");
+            // Виден ли док: при «dock» без игры на весь экран окно спрятанным не остаётся
+            Check(!Presence.Away(false, "dock") && !Presence.Away(false, "both") && Presence.Away(false, "modern") && Presence.Away(true, "dock"), "the dock goes away only for a full-screen game or the compact Windows taskbar");
+            Check(Presence.Reshow(true, Presence.Away(false, "dock"), false), "bar=dock, auto-hide off, no game, the window hidden: shown again");
+            Check(!Presence.Reshow(true, false, true) && !Presence.Reshow(true, true, false) && !Presence.Reshow(false, false, false), "already visible, away, or no real window (--demo, --headless): left alone");
+            // Компактная панель Windows: нужна только в «modern»; при «dock» выключается, при «both» — как было до дока
+            Check(CompactRules.Want("modern", -1) == 1 && CompactRules.Want("modern", 0) == 1, "modern turns the compact taskbar on");
+            Check(CompactRules.Want("dock", 1) == 0 && CompactRules.Want("dock", -1) == 0, "dock turns it off even when Windows had it on before (it holds 24 px and refuses auto-hide)");
+            Check(CompactRules.Want("both", 1) == 1 && CompactRules.Want("both", 0) == 0 && CompactRules.Want("both", -1) == -1, "both gives back what was there before the dock; nothing recorded — left alone");
             Check(AppBarRules.BottomPx(wide, 1300, 72) == 1300 && AppBarRules.BottomPx(wide, 1368, 0) == 1368, "another bar between the dock and the taskbar's place, or nothing held: the dock stays where it was");
             Check(AppBarRules.Height(77, 1) == 77 && AppBarRules.Height(77, 1.25) == 97 && AppBarRules.Height(77, 1.5) == 116 && AppBarRules.Height(77, 2) == 154, "the band is the dock at rest times the screen scale, rounded up: 77 → 77, 97, 116, 154");
             Check(AppBarRules.Height(76.8, 1.25) == 96 && AppBarRules.Height(0, 1) == 0 && AppBarRules.Height(77, 0) == 77 && AppBarRules.Height(77, double.NaN) == 77, "a whole number of pixels is not rounded up once more; no scale is 100 %");

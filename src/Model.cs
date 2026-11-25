@@ -631,7 +631,7 @@ namespace DevTxt.DockApp
             var taskbar = new object[]
             {
                 HubLink.Msg("key", "bar", "type", "choice", "label", "Внизу экрана",
-                    "hint", "dock.txt — панель задач Windows прячется, значки трея — в меню дока. Компактная панель Windows — тонкая полоса с часами, разворачивается, когда нужна; дока не видно. При переключении на неё и обратно Проводник перезапускается: открытые папки закроются",
+                    "hint", "dock.txt — панель задач Windows прячется, значки трея — в меню дока. Компактная панель Windows — тонкая полоса с часами, разворачивается, когда нужна; дока не видно. С dock.txt компактная панель выключается, даже если её включили в Windows раньше. Когда она включается или выключается, Проводник перезапускается: открытые папки закроются",
                     "value", Bar, "options", new object[] { HubLink.Msg("value", "dock", "label", "dock.txt"), HubLink.Msg("value", "modern", "label", "Компактная панель Windows"), HubLink.Msg("value", "both", "label", "dock.txt и панель Windows") }),
                 HubLink.Msg("key", "winKey", "type", "switch", "label", "Кнопка Windows открывает меню дока", "hint", "Вместо «Пуска» — меню приложений dock.txt. Сочетания вроде Win+E и Win+D работают как обычно. Действует вместе с заменой панели задач", "value", WinKey)
             };

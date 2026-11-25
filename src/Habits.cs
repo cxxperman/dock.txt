@@ -48,6 +48,25 @@ namespace DevTxt.DockApp
             return Math.Max(0, Math.Min(monitor.B - taskbar.T, monitor.Height));
         }
 
+        // То же, но не больше, чем на самом деле держат чужие полосы внизу (held, см. Held). Окно панели задач бывает
+        // выше её места: компактная панель Windows 11 (TabletPostureTaskbar = 1) в свёрнутом виде держит 24 точки, а её
+        // окно — все 72. Поверь доку окну — он встал бы над пустой полосой в 48 точек.
+        public static int Reserved(PxRect monitor, PxRect taskbar, bool autoHide, int held)
+        {
+            return Math.Min(Reserved(monitor, taskbar, autoHide), Math.Max(0, held));
+        }
+
+        // Сколько внизу монитора держат чужие полосы — по рабочей области (её Windows считает сама). Пока своя полоса
+        // занята и рабочая область кончается у её верха — то, что ниже своей полосы. Своя полоса, которая не дошла до
+        // края рабочей области (встала над пустотой), Windows в расчёт не берёт — тогда снова по рабочей области.
+        public static int Held(PxRect monitor, PxRect work, bool registered, PxRect band)
+        {
+            if (monitor.Height <= 0 || work.Height <= 0) return 0;
+            int below = work.B;
+            if (registered && band.Height > 0 && band.B <= monitor.B && work.B <= band.T + 1) below = band.B;
+            return Math.Max(0, Math.Min(monitor.B - below, monitor.Height));
+        }
+
         // Сколько занимать самому: док стоит у самого низа монитора, поверх места спрятанной панели, а своя полоса —
         // только на то, чего этому месту не хватает до высоты дока. Тогда рабочая область кончается ровно у верха дока.
         public static int Missing(int height, int reserved) { return Math.Max(0, height - Math.Max(0, reserved)); }
@@ -98,6 +117,32 @@ namespace DevTxt.DockApp
         {
             if (double.IsNaN(scale) || scale <= 0) scale = 1;
             return band.B / scale;
+        }
+    }
+
+    // ───────── Виден ли док ─────────
+    static class Presence
+    {
+        // Дока не должно быть видно совсем: впереди игра или видео на весь экран, или выбрана компактная панель Windows
+        public static bool Away(bool fullscreen, string bar) { return fullscreen || bar == "modern"; }
+
+        // Окно дока спрятано (visible — как его видит сама Windows), а ему место на экране — показать снова, кто бы
+        // его ни спрятал. live — настоящий док с окном (не снимок, не --demo, не --headless).
+        public static bool Reshow(bool live, bool away, bool visible) { return live && !away && !visible; }
+    }
+
+    // ───────── Компактная панель задач Windows 11 ─────────
+    // TabletPostureTaskbar: тонкая полоса с часами, которая разворачивается, когда нужна. Нужна она только в режиме
+    // «modern». При «dock» она мешает: спрятанная, она всё равно держит внизу место (24 точки свёрнутая, 72 развёрнутая)
+    // и не принимает автоскрытие, — поэтому выключается. При «both» — как было до дока (original; −1 — не записано,
+    // тогда не трогаем). Ответ — нужное значение, −1 — оставить как есть.
+    static class CompactRules
+    {
+        public static int Want(string bar, int original)
+        {
+            if (bar == "modern") return 1;
+            if (bar == "dock") return 0;
+            return original >= 0 ? original : -1;
         }
     }
 

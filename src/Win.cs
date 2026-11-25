@@ -294,6 +294,12 @@ namespace DevTxt.DockApp
 
         public static void Minimize(IntPtr hwnd) { ShowWindowAsync(hwnd, SW_MINIMIZE); }
 
+        // Видно ли окно — как его видит сама Windows (а не WPF: окно мог спрятать и не он)
+        public static bool Visible(IntPtr hwnd) { try { return hwnd != IntPtr.Zero && IsWindowVisible(hwnd); } catch { return true; } }
+
+        // Показать окно, не забирая фокус (SW_SHOWNOACTIVATE)
+        public static void ShowQuiet(IntPtr hwnd) { if (hwnd != IntPtr.Zero) ShowWindowAsync(hwnd, 4); }
+
         // То же, что крестик в заголовке: программа сама решает, спрашивать ли о несохранённом
         public static void Close(IntPtr hwnd) { PostMessage(hwnd, WM_SYSCOMMAND, new IntPtr(SC_CLOSE), IntPtr.Zero); }
     }

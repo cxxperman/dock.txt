@@ -173,31 +173,28 @@ namespace DevTxt.DockApp
 
         static string CompactMarker(string dir) { return dir == null ? null : Path.Combine(dir, "compact.txt"); }
 
-        // Включить компактную панель. Что было до нас, записывается один раз — чтобы потом вернуть именно это.
-        // true — значение изменилось и Проводник нужно перезапустить.
-        public static bool CompactOn(string dir)
-        {
-            int now = Compact;
-            try
-            {
-                string f = CompactMarker(dir);
-                if (f != null && !File.Exists(f)) { Directory.CreateDirectory(dir); File.WriteAllText(f, now.ToString()); }
-            }
-            catch { }
-            if (now == 1) return false;
-            WriteCompact(1);
-            return true;
-        }
-
-        // Вернуть панель задач такой, какой она была до того, как док включил компактную. true — значение изменилось.
-        public static bool CompactBack(string dir)
+        // Компактная панель по режиму (CompactRules.Want): «modern» — включить, «dock» — выключить, «both» — вернуть,
+        // как было до дока. true — значение изменилось и Проводник нужно перезапустить.
+        // Что было до дока, записывается в compact.txt один раз, перед первой переменой, — чтобы потом вернуть именно это.
+        // При «both» оно возвращается, и запись стирается. При выходе дока не трогается ничего: новое значение
+        // применилось бы только после перезапуска Проводника.
+        public static bool CompactFor(string dir, string bar)
         {
             string f = CompactMarker(dir);
-            if (f == null || !File.Exists(f)) return false;
-            int was;
-            try { if (!int.TryParse(File.ReadAllText(f).Trim(), out was)) was = 0; File.Delete(f); } catch { return false; }
-            if (Compact == was) return false;
-            WriteCompact(was);
+            int was = -1;
+            try { if (f != null && File.Exists(f) && !int.TryParse(File.ReadAllText(f).Trim(), out was)) was = 0; } catch { return false; }
+            int now = Compact, want = CompactRules.Want(bar, was);
+            if (bar != "modern" && bar != "dock")
+            {
+                try { if (was >= 0) File.Delete(f); } catch { return false; }
+            }
+            if (want < 0 || want == now) return false;
+            try
+            {
+                if (was < 0 && f != null && (bar == "modern" || bar == "dock")) { Directory.CreateDirectory(dir); File.WriteAllText(f, now.ToString()); }
+                WriteCompact(want);
+            }
+            catch { return false; }
             return true;
         }
 

@@ -338,7 +338,7 @@ namespace DevTxt.DockApp
                 ApplyAutoHide();
                 SyncTaskbar();
                 // Раз в секунду: панель задач спрятана и с автоскрытием; не освободилось ли её место (или не занято ли снова)
-                taskbarTimer.Tick += delegate { TaskbarSwap.Keep(store.Dir); ReserveCheck(); };
+                taskbarTimer.Tick += delegate { TaskbarSwap.Keep(store.Dir); ReserveCheck(); KeepShown(); };
                 autoHideCheck.Tick += delegate { AutoHideTick(); };
                 taskbarTimer.Start();
                 hookTimer.Tick += delegate { WinKey.Refresh(); };
@@ -385,8 +385,9 @@ namespace DevTxt.DockApp
             // Панель Windows спряталась — её место освободилось: полоса дока опускается к самому краю
             if (store.ReplaceTaskbar) { AppBar.Dirty(); Rebuild(); KickAutoHide(); }
             WinKey.Sync(store.ReplaceTaskbar && store.WinKey, store.ReplaceTaskbar, Dispatcher, WinPressed, WinDigitPressed);
-            // Компактная панель Windows: включаем, только когда её выбрали; иначе возвращаем, как было до нас
-            bool changed = store.Bar == "modern" ? TaskbarSwap.CompactOn(store.Dir) : TaskbarSwap.CompactBack(store.Dir);
+            // Компактная панель Windows: включаем, только когда её выбрали; при «dock» выключаем (спрятанная, она всё равно
+            // держит внизу место и не принимает автоскрытие); при «both» — как было до нас (CompactRules.Want)
+            bool changed = TaskbarSwap.CompactFor(store.Dir, store.Bar);
             if (changed) TaskbarSwap.RestartExplorer(null);   // Проводник не закрылся сам — не трогаем: панель сменится при следующем входе
             // Выбрана панель Windows — дока не видно (он остаётся запущенным: настройки, счётчики, меню приложений)
             SyncAway();
@@ -775,7 +776,11 @@ namespace DevTxt.DockApp
             PxRect bar;
             bool autoHidden;
             if (!TaskbarSwap.Where(out bar, out autoHidden)) return 0;
-            return AppBarRules.Reserved(mon, bar, autoHidden);
+            // Не больше, чем на самом деле держат полосы внизу (по рабочей области): компактная панель Windows держит
+            // меньше, чем её окно
+            PxRect wk;
+            int held = Win.PrimaryWork(out wk) ? AppBarRules.Held(mon, wk, AppBar.Registered, AppBar.Band) : mon.B - bar.T;
+            return AppBarRules.Reserved(mon, bar, autoHidden, held);
         }
 
         // Автоскрытие спрятанной панели задач: Проводник включает его не сразу, а иногда не принимает с первого раза.
@@ -1934,13 +1939,39 @@ namespace DevTxt.DockApp
         // Он уезжает за край и только потом окно прячется; возвращается — так же, выезжая.
         void SyncAway()
         {
-            bool want = fullscreen || store.Bar == "modern";
+            bool want = Presence.Away(fullscreen, store.Bar);
             if (want == away) return;
             away = want;
             if (away) ClosePreview(true);   // игра или видео на весь экран — панели с окнами тоже не место
             if (headless || demo) return;
             if (!away) Show();
             Glide();
+        }
+
+        // Раз в секунду: доку место на экране, а его окно спрятано (Presence.Reshow) — показываем снова, кто бы его ни
+        // спрятал. Сам док прячет окно только при away; если окно спрятала не эта ветка (или WPF считает его видимым,
+        // а Windows — нет, и Show() ничего не делает), — показываем и через Windows. Случай записывается в dock.log.
+        bool reshowLogged;
+
+        void KeepShown()
+        {
+            if (ended || me == IntPtr.Zero) return;
+            bool visible = Win.Visible(me);
+            if (!Presence.Reshow(!demo && !headless, away, visible)) return;
+            if (!reshowLogged && store.Dir != null)
+            {
+                reshowLogged = true;   // один раз за запуск: если Windows прячет окно снова и снова, журнал не растёт
+                try
+                {
+                    System.IO.File.AppendAllText(System.IO.Path.Combine(store.Dir, "dock.log"), DateTime.Now.ToString("s") + " окно дока было спрятано без away — показано снова (bar=" + store.Bar
+                        + ", fullscreen=" + fullscreen + ", hidden=" + hidden + ", wpfVisible=" + IsVisible + ", appBar=" + AppBar.Registered + ", reserve=" + reserve + ")\r\n");
+                }
+                catch { }
+            }
+            Show();
+            if (!Win.Visible(me)) Win.ShowQuiet(me);
+            Glide();
+            SyncGlass();
         }
 
         // Полоса едет туда, где ей сейчас место: за нижний край (автоскрытие, полный экран) или обратно
